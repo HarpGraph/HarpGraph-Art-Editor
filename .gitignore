@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.log
+.vscode/
+.idea/
+.vs/
+app_log.txt
+_backup*/
+Gcode/
+*.hgproj
+docs/ecosystem-II.txt
+docs/HANDOFF-main-project.md
+docs/ROADMAP.md
+docs/HANDOFF.md
+docs/
+PERFORMANCE_ANALYSIS.md
+IMPLEMENTATION_PLAN.md
