@@ -4,7 +4,8 @@ from PyQt5.QtWidgets import (QMainWindow, QDockWidget, QListWidget,
                            QVBoxLayout, QInputDialog, QLabel, 
                            QLineEdit, QPushButton, QHBoxLayout,
                            QApplication, QSpinBox, QMessageBox,
-                           QColorDialog)
+                           QColorDialog, QDialog, QFormLayout, QScrollArea,
+                           QGraphicsEllipseItem, QFrame)
 from PyQt5.QtCore import Qt, QSettings, QPointF, QRectF, QEvent  # Добавляем QSettings
 from PyQt5.QtGui import QPainter, QColor, QPolygonF, QPen, QBrush, QPainterPath
 from src.views.layer_dialog import NewLayerDialog
@@ -17,6 +18,7 @@ from src.graphics.grid_item import GridItem  # Добавляем импорт G
 from .grid_settings_dialog import GridSettingsDialog  # Добавить в импорты
 import numpy as np
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,11 @@ def _points_in_polygon(xs, ys, poly):
         x1, y1 = x2, y2
     return inside
 
+# Фон вне рабочего поля -- нейтральный, чтобы цвет поля красил только само поле
+OUTSIDE_BG_COLOR = QColor('#3a3a3a')
+# Допуск (в пикселях экрана) для замыкания полигона кликом по первой точке
+POLYGON_CLOSE_TOL_PX = 7.0
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__() 
@@ -48,13 +55,17 @@ class MainWindow(QMainWindow):
         self.field_h_mm = 400.0
         self.field_bg_color = QColor(Qt.white)
         self.field_rect_item = None
+        self.field_fill_item = None
         self.setup_ui()
         self.load_grid_settings()  # Загружаем настройки сетки
         self.load_field_settings()  # Загружаем размер рабочего поля
-        self.create_coordinates_widget()  # Создаем виджет для отображения координат
         self.selection_mode = False
         self.selection_points = []
         self.selection_path_item = None
+        self.selection_marker_item = None
+        self.selection_layer = None
+        self.selection_cursor = None
+        self._polygon_cancel_ts = 0.0   # время последней отмены полигона правой кнопкой
         self._prev_drag_mode = None
         self.scene.installEventFilter(self)
         self._update_scene_bounds()  # ограничить прокрутку полем+содержимым
@@ -64,10 +75,9 @@ class MainWindow(QMainWindow):
     def setup_ui(self):
         # Основное окно просмотра
         self.scene = QGraphicsScene(self)
-        # QOpenGLWidget clears to black by default -- pin the background colour
-        # explicitly (configurable -- see set_field_bg_color) so it doesn't
-        # depend on the viewport widget type
-        self.scene.setBackgroundBrush(QBrush(self.field_bg_color))
+        # Фон сцены -- нейтральный; цвет, выбранный пользователем, красит только
+        # прямоугольник рабочего поля (см. _update_field_visual)
+        self.scene.setBackgroundBrush(QBrush(OUTSIDE_BG_COLOR))
         self.view = QGraphicsView(self.scene)
         
         # Добавляем сетку
@@ -89,6 +99,8 @@ class MainWindow(QMainWindow):
         # left-drag pans the canvas (much easier than scrollbars); items with
         # ItemIsMovable still consume the press themselves and move instead
         self.view.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.view.viewport().installEventFilter(self)
+        self.view.viewport().setCursor(Qt.ArrowCursor)
         
         # Добавляем обработку масштабирования
         self.view.wheelEvent = self.handle_wheel_event
@@ -322,113 +334,141 @@ class MainWindow(QMainWindow):
         logger.debug("View fit to layer content")
 
     def create_toolbar(self):
-        toolbar = QToolBar()
+        """Меню сверху (всё доступно мышью, ничего не прячется в '>>') и короткая
+        панель самых частых действий."""
+        toolbar = QToolBar("Быстрые действия")
+        toolbar.setMovable(False)
         self.addToolBar(toolbar)
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("Файл")
+        layer_menu = menubar.addMenu("Слой")
+        view_menu = menubar.addMenu("Вид")
+        field_menu = menubar.addMenu("Рабочее поле")
+        grid_menu = menubar.addMenu("Сетка")
 
-        # Действие для создания нового слоя
+        # --- Файл ---
         new_layer_action = QAction("Новый слой", self)
         new_layer_action.triggered.connect(self.create_new_layer)
+        file_menu.addAction(new_layer_action)
         toolbar.addAction(new_layer_action)
 
-        # Действие для загрузки файла
         load_file_action = QAction("Загрузить файл", self)
         load_file_action.triggered.connect(self.load_file_to_layer)
+        file_menu.addAction(load_file_action)
         toolbar.addAction(load_file_action)
 
-        # Действие для выделения полигона и экспорта точек
-        self.polygon_action = QAction("Выделить полигон", self)
-        self.polygon_action.setCheckable(True)
-        self.polygon_action.triggered.connect(self.toggle_polygon_selection)
-        toolbar.addAction(self.polygon_action)
+        file_menu.addSeparator()
 
-        delete_layer_action = QAction("Удалить слой", self)
-        delete_layer_action.triggered.connect(self.delete_selected_layers)
-        toolbar.addAction(delete_layer_action)
-
-        move_up_action = QAction("Вверх", self)
-        move_up_action.triggered.connect(lambda: self.move_layer(-1))
-        toolbar.addAction(move_up_action)
-
-        move_down_action = QAction("Вниз", self)
-        move_down_action.triggered.connect(lambda: self.move_layer(1))
-        toolbar.addAction(move_down_action)
-
-        # Разделитель
-        toolbar.addSeparator()
-
-        save_project_action = QAction("💾 Сохранить проект...", self)
+        save_project_action = QAction("Сохранить проект...", self)
         save_project_action.setToolTip("Сохранить все слои с файлами/цветами/позицией в один файл-пресет")
         save_project_action.triggered.connect(self.save_project_dialog)
-        toolbar.addAction(save_project_action)
+        file_menu.addAction(save_project_action)
 
-        open_project_action = QAction("📂 Открыть проект...", self)
+        open_project_action = QAction("Открыть проект...", self)
         open_project_action.setToolTip("Восстановить все слои из сохранённого проекта")
         open_project_action.triggered.connect(self.open_project_dialog)
-        toolbar.addAction(open_project_action)
+        file_menu.addAction(open_project_action)
 
-        # Добавляем разделитель
+        # --- Слой ---
+        delete_layer_action = QAction("Удалить слой", self)
+        delete_layer_action.triggered.connect(self.delete_selected_layers)
+        layer_menu.addAction(delete_layer_action)
+
+        move_up_action = QAction("Поднять слой вверх", self)
+        move_up_action.triggered.connect(lambda: self.move_layer(-1))
+        layer_menu.addAction(move_up_action)
+
+        move_down_action = QAction("Опустить слой вниз", self)
+        move_down_action.triggered.connect(lambda: self.move_layer(1))
+        layer_menu.addAction(move_down_action)
+
         toolbar.addSeparator()
 
-        # Вернуть фокус в центр рабочего поля, не меняя масштаб
+        # --- Вид ---
         center_action = QAction("⌖ В центр", self)
         center_action.setToolTip("Вернуть фокус в центр рабочего поля (0,0), не меняя масштаб (клавиша C)")
         center_action.setShortcut("C")
         center_action.triggered.connect(self.center_view_on_origin)
+        view_menu.addAction(center_action)
         toolbar.addAction(center_action)
 
-        # Показать все загруженные линии -- спасение, если вид 'улетел'
         fit_content_action = QAction("⤢ По линиям", self)
         fit_content_action.setToolTip("Показать все загруженные линии целиком (клавиша F)")
         fit_content_action.setShortcut("F")
         fit_content_action.triggered.connect(self.fit_view_to_content)
+        view_menu.addAction(fit_content_action)
         toolbar.addAction(fit_content_action)
 
-        # Размер рабочего поля + сброс вида к нему (устойчивый ориентир, как в Gcode_Terminal)
-        toolbar.addWidget(QLabel(" Поле мм:"))
+        fit_field_action = QAction("⤢ По полю", self)
+        fit_field_action.setToolTip("Показать всё рабочее поле целиком (клавиша Home)")
+        fit_field_action.setShortcut("Home")
+        fit_field_action.triggered.connect(self.fit_view_to_field)
+        view_menu.addAction(fit_field_action)
+        toolbar.addAction(fit_field_action)
+
+        # --- Рабочее поле: размер и цвет в одном окне ---
         self.field_w_spin = QSpinBox()
         self.field_w_spin.setRange(10, 20000)
         self.field_w_spin.setValue(int(self.field_w_mm))
-        self.field_w_spin.setSuffix(" Ш")
+        self.field_w_spin.setSuffix(" мм")
         self.field_w_spin.setToolTip("Ширина рабочего поля машины (мм)")
         self.field_w_spin.valueChanged.connect(self._on_field_size_changed)
-        toolbar.addWidget(self.field_w_spin)
 
         self.field_h_spin = QSpinBox()
         self.field_h_spin.setRange(10, 20000)
         self.field_h_spin.setValue(int(self.field_h_mm))
-        self.field_h_spin.setSuffix(" В")
+        self.field_h_spin.setSuffix(" мм")
         self.field_h_spin.setToolTip("Высота рабочего поля машины (мм)")
         self.field_h_spin.valueChanged.connect(self._on_field_size_changed)
-        toolbar.addWidget(self.field_h_spin)
 
-        fit_field_action = QAction("⤢ По размеру поля", self)
-        fit_field_action.setToolTip("Показать всё рабочее поле целиком (клавиша Home)")
-        fit_field_action.setShortcut("Home")
-        fit_field_action.triggered.connect(self.fit_view_to_field)
-        toolbar.addAction(fit_field_action)
+        self.field_dialog = QDialog(self)
+        self.field_dialog.setWindowTitle("Рабочее поле")
+        form = QFormLayout(self.field_dialog)
+        form.addRow("Ширина:", self.field_w_spin)
+        form.addRow("Высота:", self.field_h_spin)
+        self.field_color_btn = QPushButton()
+        self.field_color_btn.setFixedHeight(24)
+        self.field_color_btn.setToolTip("Цвет рабочего поля (фон вне поля не меняется)")
+        self.field_color_btn.clicked.connect(self.pick_field_bg_color)
+        form.addRow("Цвет поля:", self.field_color_btn)
+        close_btn = QPushButton("Закрыть")
+        close_btn.clicked.connect(self.field_dialog.hide)
+        form.addRow(close_btn)
+        self._update_field_color_button()
 
-        field_color_action = QAction("🎨 Цвет поля", self)
-        field_color_action.setToolTip("Цвет фона рабочего поля (замена слою-заливке)")
+        field_settings_action = QAction("Размер и цвет поля...", self)
+        field_settings_action.triggered.connect(self.show_field_dialog)
+        field_menu.addAction(field_settings_action)
+        field_color_action = QAction("Цвет поля...", self)
         field_color_action.triggered.connect(self.pick_field_bg_color)
-        toolbar.addAction(field_color_action)
+        field_menu.addAction(field_color_action)
+        field_menu.addSeparator()
+        field_menu.addAction(fit_field_action)
 
-        # Добавляем разделитель
-        toolbar.addSeparator()
-        
-        # Добавляем действия для сетки
-        self.grid_action = QAction("Сетка", self)
+        # --- Сетка ---
+        self.grid_action = QAction("Показывать сетку", self)
         self.grid_action.setCheckable(True)
         self.grid_action.setChecked(True)
         self.grid_action.triggered.connect(self.toggle_grid)
-        toolbar.addAction(self.grid_action)
-        
-        self.grid_step_action = QAction("Шаг сетки", self)
+        grid_menu.addAction(self.grid_action)
+        view_menu.addAction(self.grid_action)
+
+        self.grid_step_action = QAction("Шаг сетки...", self)
         self.grid_step_action.triggered.connect(self.set_grid_step)
-        toolbar.addAction(self.grid_step_action)
-        
-        self.grid_opacity_action = QAction("Настройки сетки", self)  # Было "Прозрачность сетки"
+        grid_menu.addAction(self.grid_step_action)
+
+        self.grid_opacity_action = QAction("Цвет и прозрачность сетки...", self)
         self.grid_opacity_action.triggered.connect(self.set_grid_opacity)
-        toolbar.addAction(self.grid_opacity_action)
+        grid_menu.addAction(self.grid_opacity_action)
+
+    def show_field_dialog(self):
+        self.field_dialog.show()
+        self.field_dialog.raise_()
+        self.field_dialog.activateWindow()
+
+    def _update_field_color_button(self):
+        self.field_color_btn.setStyleSheet(
+            f"background-color: {self.field_bg_color.name()}; border: 1px solid black;")
 
     def load_grid_settings(self):
         """Загрузка настроек сетки"""
@@ -463,6 +503,13 @@ class MainWindow(QMainWindow):
         не зависящий от масштаба/загруженного файла (см. GCodeViewer в Gcode_Terminal)."""
         hw, hh = self.field_w_mm / 2.0, self.field_h_mm / 2.0
         rect = QRectF(-hw, -hh, self.field_w_mm, self.field_h_mm)
+        if self.field_fill_item is None:
+            # заливка -- ниже сетки, красит только рабочее поле
+            self.field_fill_item = self.scene.addRect(rect, QPen(Qt.NoPen), QBrush(self.field_bg_color))
+            self.field_fill_item.setZValue(-1100)
+        else:
+            self.field_fill_item.setRect(rect)
+            self.field_fill_item.setBrush(QBrush(self.field_bg_color))
         if self.field_rect_item is None:
             pen = QPen(QColor(90, 90, 140))
             pen.setCosmetic(True)
@@ -491,8 +538,8 @@ class MainWindow(QMainWindow):
             self.field_h_spin.setValue(int(self.field_h_mm))
             self.field_w_spin.blockSignals(False)
             self.field_h_spin.blockSignals(False)
-            self.scene.setBackgroundBrush(QBrush(self.field_bg_color))
             self._update_field_visual()
+            self._update_field_color_button()
             logger.debug(f"Loaded field settings: {self.field_w_mm}x{self.field_h_mm}, bg={self.field_bg_color.name()}")
         except Exception as e:
             logger.error(f"Error loading field settings: {e}")
@@ -508,11 +555,12 @@ class MainWindow(QMainWindow):
             logger.error(f"Error saving field settings: {e}")
 
     def pick_field_bg_color(self):
-        """Цвет фона рабочего поля -- замена отдельного слоя-заливки."""
+        """Цвет рабочего поля (только прямоугольник поля, не весь фон)."""
         color = QColorDialog.getColor(self.field_bg_color, self, "Цвет рабочего поля")
         if color.isValid():
             self.field_bg_color = color
-            self.scene.setBackgroundBrush(QBrush(color))
+            self._update_field_visual()
+            self._update_field_color_button()
             self.save_field_settings()
             logger.debug(f"Field background color set to {color.name()}")
 
@@ -531,13 +579,6 @@ class MainWindow(QMainWindow):
         self.grid.setVisible(checked)
         self.save_grid_settings()
         logger.debug(f"Grid visibility set to {checked}")
-
-    def toggle_polygon_selection(self, checked):
-        """Включение/выключение режима выделения полигона"""
-        if checked:
-            self.start_polygon_selection()
-        else:
-            self.cancel_polygon_selection()
 
     def set_grid_step(self):
         """Настройка шага сетки"""
@@ -596,6 +637,12 @@ class MainWindow(QMainWindow):
 
             # Добавляем слой в список
             self.layers.append(layer)
+
+            # Элемент G-code/SVG слоя появляется только после фоновой загрузки --
+            # тогда же нужно выставить порядок слоёв (Z) и активный слой
+            load_sig = getattr(layer, 'load_finished', None)
+            if load_sig is not None:
+                load_sig.connect(lambda ok: self._on_layer_item_ready())
             
             # Создаем элемент списка
             item = QListWidgetItem()
@@ -611,20 +658,34 @@ class MainWindow(QMainWindow):
             logger.error(f"Error creating layer: {e}")
             return None
 
-    def start_polygon_selection(self):
+    def start_polygon_selection(self, layer=None):
+        """Режим рисования полигона для слоя `layer` (запускается из панели слоя)."""
         try:
+            self.cancel_polygon_selection()
+            self.selection_layer = layer
             self.selection_mode = True
             self.selection_points = []
-            if self.selection_path_item:
-                self.scene.removeItem(self.selection_path_item)
-                self.selection_path_item = None
+            self.selection_cursor = None
             pen = QPen(Qt.red, 0)
             pen.setStyle(Qt.DashLine)
             self.selection_path_item = self.scene.addPath(QPainterPath(), pen)
             self.selection_path_item.setZValue(10000)
+            # кружок на первой точке -- виден, куда кликать для замыкания
+            self.selection_marker_item = QGraphicsEllipseItem(-POLYGON_CLOSE_TOL_PX, -POLYGON_CLOSE_TOL_PX,
+                                                              2 * POLYGON_CLOSE_TOL_PX, 2 * POLYGON_CLOSE_TOL_PX)
+            self.selection_marker_item.setFlag(self.selection_marker_item.ItemIgnoresTransformations, True)
+            self.selection_marker_item.setPen(QPen(Qt.red, 2))
+            self.selection_marker_item.setBrush(QBrush(QColor(255, 0, 0, 60)))
+            self.selection_marker_item.setZValue(10001)
+            self.selection_marker_item.setVisible(False)
+            self.scene.addItem(self.selection_marker_item)
             self._prev_drag_mode = self.view.dragMode()
             self.view.setDragMode(QGraphicsView.NoDrag)
             self.view.setCursor(Qt.CrossCursor)
+            self.view.setFocus()
+            self.statusBar().showMessage(
+                "Полигон: клик — поставить точку | замкнуть: клик по первой точке (красный кружок), "
+                "двойной клик или Enter | Backspace — убрать последнюю точку | Esc или правая кнопка — отмена")
         except Exception as e:
             logger.error(f"Error starting polygon selection: {e}", exc_info=True)
             self.cancel_polygon_selection()
@@ -633,15 +694,17 @@ class MainWindow(QMainWindow):
         try:
             self.selection_mode = False
             self.selection_points = []
-            if self.selection_path_item:
-                self.scene.removeItem(self.selection_path_item)
-                self.selection_path_item = None
-            if hasattr(self, 'polygon_action'):
-                self.polygon_action.setChecked(False)
+            self.selection_cursor = None
+            for name in ('selection_path_item', 'selection_marker_item'):
+                it = getattr(self, name, None)
+                if it is not None and it.scene() is not None:
+                    self.scene.removeItem(it)
+                setattr(self, name, None)
             if self._prev_drag_mode is not None:
                 self.view.setDragMode(self._prev_drag_mode)
                 self._prev_drag_mode = None
             self.view.setCursor(Qt.ArrowCursor)
+            self.statusBar().clearMessage()
         except Exception as e:
             logger.error(f"Error canceling polygon selection: {e}", exc_info=True)
 
@@ -659,19 +722,43 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.layer_list)
         
         # Создаем контейнер для виджета слоя
+        # Панель слоя может быть выше окна -- даём прокрутку, чтобы все настройки были достижимы
+        self.layer_list.setMaximumHeight(140)
         self.layer_widget_container = QWidget()
         self.layer_widget_layout = QVBoxLayout(self.layer_widget_container)
-        main_layout.addWidget(self.layer_widget_container)
+        self.layer_widget_layout.setAlignment(Qt.AlignTop)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(self.layer_widget_container)
+        main_layout.addWidget(scroll, 1)
         
         dock.setWidget(main_widget)
+        dock.setMinimumWidth(340)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
         
         # Подключаем обработчик выбора слоя
         self.layer_list.currentItemChanged.connect(self.on_layer_selected)
 
+    def _on_layer_item_ready(self):
+        self.update_layers_z_values()
+        self._sync_active_layer()
+
+    def _sync_active_layer(self, current=None):
+        """Выбор/наведение точек работают только на активном (выбранном) слое:
+        у остальных выделение сбрасывается и пропадает с листа."""
+        if current is None:
+            current = self.layer_list.currentItem()
+        active_layer = current.data(Qt.UserRole) if current is not None else None
+        for layer in self.layers:
+            item = getattr(layer, 'current_item', None)
+            if item is not None and hasattr(item, 'set_active'):
+                item.set_active(active_layer is None or layer is active_layer)
+
     def on_layer_selected(self, current, previous):
         """Обработчик выбора слоя в списке"""
         try:
+            self._sync_active_layer(current)
             # Очищаем контейнер
             while self.layer_widget_layout.count():
                 item = self.layer_widget_layout.takeAt(0)
@@ -689,26 +776,69 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error in layer selection: {e}", exc_info=True)
 
+    def _near_first_point(self, pos) -> bool:
+        """Клик у первой точки: допуск в ПИКСЕЛЯХ экрана, а не в мм сцены --
+        иначе при мелком масштабе полигон замыкался бы далеко от первой точки."""
+        if not self.selection_points:
+            return False
+        first = self.selection_points[0]
+        scale = max(self.view.transform().m11(), 1e-9)
+        dist_px = ((pos.x() - first.x()) ** 2 + (pos.y() - first.y()) ** 2) ** 0.5 * scale
+        return dist_px <= POLYGON_CLOSE_TOL_PX
+
     def eventFilter(self, obj, event):
         try:
-            if self.selection_mode and event.type() == QEvent.GraphicsSceneMousePress:
-                if event.button() == Qt.LeftButton:
-                    pos = event.scenePos()
-                    # Проверяем замыкание полигона
-                    if self.selection_points and len(self.selection_points) >= 3:
-                        first = self.selection_points[0]
-                        if (pos - first).manhattanLength() < 10:
+            # курсор «ладошка» (панорамирование) заменяем обычной стрелкой --
+            # ладошкой трудно точно попасть по точке
+            if event.type() == QEvent.CursorChange and obj is self.view.viewport():
+                if obj.cursor().shape() in (Qt.OpenHandCursor, Qt.ClosedHandCursor):
+                    obj.setCursor(Qt.ArrowCursor)
+                return False
+            if self.selection_mode:
+                etype = event.type()
+                if etype == QEvent.GraphicsSceneMousePress:
+                    if event.button() == Qt.LeftButton:
+                        pos = event.scenePos()
+                        if len(self.selection_points) >= 3 and self._near_first_point(pos):
                             self.finalize_polygon_selection()
-                            return True
-                    self.selection_points.append(pos)
+                        else:
+                            self.selection_points.append(pos)
+                            self.update_selection_path()
+                        return True
+                    elif event.button() == Qt.RightButton:
+                        self._polygon_cancel_ts = time.monotonic()
+                        self.cancel_polygon_selection()
+                        return True
+                elif etype == QEvent.GraphicsSceneMouseDoubleClick:
+                    if event.button() == Qt.LeftButton and len(self.selection_points) >= 3:
+                        self.finalize_polygon_selection()
+                    return True
+                elif etype == QEvent.GraphicsSceneMouseMove:
+                    self.selection_cursor = event.scenePos()
                     self.update_selection_path()
-                    return True
-                elif event.button() == Qt.RightButton:
-                    self.cancel_polygon_selection()
-                    return True
         except Exception as e:
             logger.error(f"Error in event filter: {e}", exc_info=True)
         return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event):
+        if self.selection_mode:
+            key = event.key()
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                if len(self.selection_points) >= 3:
+                    self.finalize_polygon_selection()
+                event.accept()
+                return
+            if key == Qt.Key_Escape:
+                self.cancel_polygon_selection()
+                event.accept()
+                return
+            if key == Qt.Key_Backspace:
+                if self.selection_points:
+                    self.selection_points.pop()
+                    self.update_selection_path()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def update_selection_path(self):
         if not self.selection_path_item or not self.selection_points:
@@ -717,15 +847,20 @@ class MainWindow(QMainWindow):
         path.moveTo(self.selection_points[0])
         for p in self.selection_points[1:]:
             path.lineTo(p)
+        if self.selection_cursor is not None:
+            path.lineTo(self.selection_cursor)
         self.selection_path_item.setPath(path)
+        if self.selection_marker_item is not None:
+            self.selection_marker_item.setPos(self.selection_points[0])
+            self.selection_marker_item.setVisible(True)
 
     def finalize_polygon_selection(self):
-        if len(self.selection_points) < 3:
-            self.cancel_polygon_selection()
-            return
-        polygon = QPolygonF(self.selection_points)
-        self.save_points_in_polygon(polygon)
+        points = list(self.selection_points)
+        layer = self.selection_layer
         self.cancel_polygon_selection()
+        if len(points) < 3:
+            return
+        self.save_points_in_polygon(QPolygonF(points), layer)
 
     def load_file_to_layer(self):
         try:
@@ -842,7 +977,9 @@ class MainWindow(QMainWindow):
             self.on_layer_selected(current_item, None)
         logger.debug(f"View scaled to: {scale}, grid visible: {grid_visible}")
 
-    def save_points_in_polygon(self, polygon: QPolygonF):
+    def save_points_in_polygon(self, polygon: QPolygonF, layer=None):
+        """Сохранить точки G-code внутри полигона. `layer` -- слой, из панели которого
+        запущено выделение; без него берутся все видимые G-code слои."""
         try:
             filename, _ = QFileDialog.getSaveFileName(
                 self,
@@ -855,9 +992,10 @@ class MainWindow(QMainWindow):
 
             poly = np.array([[p.x(), p.y()] for p in polygon], dtype=np.float64)
             total = 0
+            source_layers = [layer] if layer is not None else self.layers
             with open(filename, 'w', encoding='utf-8') as f:
-                f.write("; Filtered G-code generated from selection\n")
-                for layer in self.layers:
+                f.write("; Filtered G-code from selection\n")
+                for layer in source_layers:
                     if not (getattr(layer, 'visible', True) and layer.type == LayerType.GCODE
                             and getattr(layer, 'current_item', None)):
                         continue
@@ -885,40 +1023,6 @@ class MainWindow(QMainWindow):
             logger.debug(f"Saved {total} commands to {filename}")
         except Exception as e:
             logger.error(f"Error saving points in polygon: {e}", exc_info=True)
-
-    def create_coordinates_widget(self):
-        """Создание виджета для отображения координат"""
-        coords_widget = QWidget()
-        layout = QHBoxLayout(coords_widget)
-        
-        # Метка для координат
-        self.coords_label = QLabel("Координаты:")
-        layout.addWidget(self.coords_label)
-        
-        # Поле для отображения координат
-        self.coords_display = QLineEdit()
-        self.coords_display.setReadOnly(True)
-        self.coords_display.setMinimumWidth(200)
-        layout.addWidget(self.coords_display)
-        
-        # Кнопка копирования
-        copy_button = QPushButton("Копировать")
-        copy_button.clicked.connect(self.copy_coordinates)
-        layout.addWidget(copy_button)
-        
-        # Добавляем виджет в тулбар
-        coords_toolbar = QToolBar()
-        coords_toolbar.addWidget(coords_widget)
-        self.addToolBar(coords_toolbar)
-        
-    def update_coordinates(self, coords: str):
-        """Обновление отображаемых координат"""
-        self.coords_display.setText(coords)
-        
-    def copy_coordinates(self):
-        """Копирование координат в буфер обмена"""
-        if self.coords_display.text():
-            QApplication.clipboard().setText(self.coords_display.text())
 
     def scale_view(self, factor):
         """Масштабирование вида и сетки -- с пределами, чтобы нельзя было

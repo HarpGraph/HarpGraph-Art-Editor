@@ -1,5 +1,5 @@
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QCheckBox, QGroupBox, QRadioButton,
-                             QPushButton, QColorDialog, QDoubleSpinBox, QFileDialog)
+                             QPushButton, QColorDialog, QDoubleSpinBox, QFileDialog, QComboBox)
 from PyQt5.QtCore import Qt
 import logging
 from ..models.base_layer import BaseLayer
@@ -62,12 +62,10 @@ class LayerWidget(QWidget):
                 self.lines_radio = QRadioButton("Линии")
                 self.points_radio = QRadioButton("Точки")
                 self.both_radio = QRadioButton("Линии и точки")
-                self.coords_radio = QRadioButton("Точки с координатами")
                 
                 mode_layout.addWidget(self.lines_radio)
                 mode_layout.addWidget(self.points_radio)
                 mode_layout.addWidget(self.both_radio)
-                mode_layout.addWidget(self.coords_radio)
 
                 # Кнопки цветов
                 color_layout = QHBoxLayout()
@@ -122,10 +120,8 @@ class LayerWidget(QWidget):
                 # Положение и размер относительно рабочего поля (центр поля = 0,0)
                 self._setup_transform_ui(mode_layout)
 
-                # Сохранить часть файла (визуальная обрезка ползунками)
-                self.export_range_btn = QPushButton("Обрезать / сохранить часть...")
-                self.export_range_btn.clicked.connect(self.on_export_range)
-                mode_layout.addWidget(self.export_range_btn)
+                # Редактирование G-code: все действия -- в одном списке (будет расти)
+                self._setup_edit_ui(mode_layout)
 
                 mode_group.setLayout(mode_layout)
                 layout.addWidget(mode_group)
@@ -134,7 +130,6 @@ class LayerWidget(QWidget):
                 self.lines_radio.toggled.connect(lambda checked: self.on_mode_changed('lines') if checked else None)
                 self.points_radio.toggled.connect(lambda checked: self.on_mode_changed('points') if checked else None)
                 self.both_radio.toggled.connect(lambda checked: self.on_mode_changed('both') if checked else None)
-                self.coords_radio.toggled.connect(lambda checked: self.on_mode_changed('coords') if checked else None)
                 
                 # Восстанавливаем текущий режим отображения
                 current_mode = self.layer.current_item.render_mode if self.layer.current_item else 'both'
@@ -142,10 +137,8 @@ class LayerWidget(QWidget):
                     self.lines_radio.setChecked(True)
                 elif current_mode == 'points':
                     self.points_radio.setChecked(True)
-                elif current_mode == 'both':
+                else:
                     self.both_radio.setChecked(True)
-                elif current_mode == 'coords':
-                    self.coords_radio.setChecked(True)
             elif isinstance(self.layer, ImageLayer):
                 image_group = QGroupBox("Параметры изображения")
                 image_layout = QVBoxLayout()
@@ -244,6 +237,48 @@ class LayerWidget(QWidget):
 
         except Exception as e:
             logger.error(f"Error setting up layer widget UI: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Редактирование G-code: выпадающий список действий + кнопка «Выполнить»
+    # ------------------------------------------------------------------
+
+    def _gcode_edit_actions(self):
+        """(название, обработчик) -- сюда добавляются новые операции редактирования."""
+        return [
+            ("Обрезать / сохранить часть (ползунки)...", self.on_export_range),
+            ("Выделить полигоном и сохранить...", self.on_select_polygon),
+        ]
+
+    def _setup_edit_ui(self, parent_layout):
+        group = QGroupBox("Редактирование G-code")
+        v = QVBoxLayout()
+        self.edit_combo = QComboBox()
+        self._edit_handlers = []
+        for title, handler in self._gcode_edit_actions():
+            self.edit_combo.addItem(title)
+            self._edit_handlers.append(handler)
+        v.addWidget(self.edit_combo)
+        run_btn = QPushButton("Выполнить")
+        run_btn.setToolTip("Запустить выбранное действие над этим слоем")
+        run_btn.clicked.connect(self.on_run_edit_action)
+        v.addWidget(run_btn)
+        group.setLayout(v)
+        parent_layout.addWidget(group)
+
+    def on_run_edit_action(self):
+        idx = self.edit_combo.currentIndex()
+        if 0 <= idx < len(self._edit_handlers):
+            self._edit_handlers[idx]()
+
+    def on_select_polygon(self):
+        try:
+            item = getattr(self.layer, 'current_item', None)
+            if item is None or item.point_count() == 0:
+                logger.warning("No G-code loaded for this layer -- nothing to select")
+                return
+            self.window().start_polygon_selection(self.layer)
+        except Exception as e:
+            logger.error(f"Error starting polygon selection: {e}", exc_info=True)
 
     def on_visibility_changed(self, visible):
         self.layer.visible = visible

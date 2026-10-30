@@ -20,11 +20,13 @@ operations (offset/scale to the work field, jitter, smoothing, thinning):
 they all become vectorised array transforms feeding _rebuild_chunks().
 """
 import struct
+import time
 import logging
 
 import numpy as np
-from PyQt5.QtWidgets import QGraphicsItem, QGraphicsItemGroup, QGraphicsView
-from PyQt5.QtGui import QPainterPath, QPen, QColor
+from PyQt5.QtWidgets import (QGraphicsItem, QGraphicsItemGroup, QGraphicsView,
+                             QMenu, QToolTip, QApplication)
+from PyQt5.QtGui import QPainterPath, QPen, QColor, QTransform
 from PyQt5.QtCore import (Qt, QRectF, QPointF, QTimer, QByteArray,
                           QDataStream)
 
@@ -182,12 +184,9 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
         self.setAcceptHoverEvents(True)
         self.initial_pos = None
         self._main_window = None          # OPT-8: cached main window ref
-        # OPT-7: one shared hover timer for the whole item
-        self._hover_timer = QTimer()
-        self._hover_timer.setSingleShot(True)
-        self._hover_timer.setInterval(2000)
-        self._hover_timer.timeout.connect(self._on_hover_timer)
-        self._hovered_marker = None       # current marker under cursor
+        self._hovered_idx = None          # индекс вершины под курсором
+        self._active = True               # слой, с которым сейчас работают (см. set_active)
+        self._selected_idx = None         # вершина, выбранная левой кнопкой
         self._bounding_rect = QRectF()
         self._chunks = []                 # OPT-12 chunk children
         # OPT-13: lazy sorted-by-X index for fast hover lookups
@@ -196,6 +195,10 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
         self._trim_overlay_item = None      # colour-tint preview overlay
         self._trim_kept_draw_item = None    # 'hide removed' preview -- kept draw strokes
         self._trim_kept_travel_item = None  # 'hide removed' preview -- kept travel strokes
+        self._trim_range = None             # (start, end) вершин в предпросмотре обрезки
+        self._trim_hide = True
+        self._trim_color = QColor(90, 90, 90)
+        self._trim_opacity = 0.6
         self._rebuild_pens()
 
     # ------------------------------------------------------------------
@@ -212,13 +215,8 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
         self.travel_pen_solid.setCosmetic(True)
 
     # ------------------------------------------------------------------
-    # OPT-7 / OPT-8 helpers
+    # OPT-8 helpers
     # ------------------------------------------------------------------
-
-    def _on_hover_timer(self):
-        """OPT-7: shared timer callback -- delegate to the hovered marker."""
-        if self._hovered_marker is not None:
-            self._hovered_marker._show_hover()
 
     def _get_main_window(self):
         """OPT-8: return main window, cache on first call."""
@@ -286,9 +284,8 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
             self.clear_trim_highlight()
             self._rebuild_chunks()
 
-            self._hover_timer.stop()
-            self._hovered_marker = None
-            self.setPos(0, 0)
+            self._hovered_idx = None
+            self._selected_idx = None
             self.prepareGeometryChange()
             logger.debug(f'Loaded points: {n} in {len(self._chunks)} chunks')
 
@@ -340,8 +337,7 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
 
     def update_points(self):
         """No per-point QGraphicsItems -- just reset hover state and repaint."""
-        self._hovered_marker = None
-        self._hover_timer.stop()
+        self._hovered_idx = None
         self.update()
 
     # ------------------------------------------------------------------
@@ -359,6 +355,16 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
     # ------------------------------------------------------------------
 
     MAX_POINTS_DRAWN = 30000
+    POINT_SIZE_PX = 3.0          # размер точки на экране не зависит от масштаба и наведения
+    HOVER_TOL_PX = 5.0
+
+    def _view_scale(self) -> float:
+        """Экранных пикселей на единицу координат элемента."""
+        mw = self._get_main_window()
+        try:
+            return max(mw.view.transform().m11() * abs(self.sceneTransform().m11()), 1e-9)
+        except Exception:
+            return 1.0
 
     def paint(self, painter, option, widget):
         if self.render_mode not in ('points', 'both', 'coords'):
@@ -379,67 +385,163 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
         if len(idx) > self.MAX_POINTS_DRAWN:
             idx = idx[:: len(idx) // self.MAX_POINTS_DRAWN + 1]
 
-        painter.save()
-        pen = QPen(self.point_color, 1.0)      # 1 scene unit, like the old markers
-        pen.setCapStyle(Qt.RoundCap)
-        painter.setPen(pen)
-        pts = self.pts
-        points = [QPointF(float(pts[i, 0]), float(pts[i, 1])) for i in idx]
-        if points:
-            painter.drawPoints(*points)
+        # при предпросмотре обрезки точки вне оставляемого диапазона
+        # скрываются или тонируются так же, как линии
+        removed_idx = np.empty(0, dtype=idx.dtype)
+        if self._trim_range is not None:
+            keep = (idx >= self._trim_range[0]) & (idx <= self._trim_range[1])
+            removed_idx = idx[~keep]
+            idx = idx[keep]
 
-        marker = self._hovered_marker
-        if marker is not None:
-            hover_pen = QPen(self.point_color.lighter(150), 1.6)
-            hover_pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(hover_pen)
-            painter.drawPoint(QPointF(marker.x, marker.y))
+        painter.save()
+        pts = self.pts
+        # Точки рисуем в координатах экрана (без трансформации): при огромном
+        # увеличении косметическое перо вырождалось в короткую горизонтальную линию
+        tr = painter.worldTransform()
+        painter.setWorldTransform(QTransform())
+
+        def to_device(x, y):
+            return (x * tr.m11() + y * tr.m21() + tr.dx(),
+                    x * tr.m12() + y * tr.m22() + tr.dy())
+
+        def draw(indices, color):
+            if not len(indices):
+                return
+            pen = QPen(color, self.POINT_SIZE_PX)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            dx, dy = to_device(pts[indices, 0].astype(np.float64), pts[indices, 1].astype(np.float64))
+            painter.drawPoints(*[QPointF(float(a), float(b)) for a, b in zip(dx, dy)])
+
+        if len(removed_idx) and not self._trim_hide:
+            tint = QColor(self._trim_color)
+            tint.setAlphaF(max(0.0, min(1.0, self._trim_opacity)))
+            draw(removed_idx, tint)
+        draw(idx, self.point_color)
+
+        for idx_, color_, extra in ((self._selected_idx, QColor(255, 200, 0), True),
+                                    (self._hovered_idx, self.point_color.lighter(170), False)):
+            if idx_ is None or idx_ >= n or not self._in_kept_range(idx_):
+                continue
+            hx, hy = to_device(float(pts[idx_, 0]), float(pts[idx_, 1]))
+            if extra:
+                # выбранная точка -- кольцо вокруг неизменной точки
+                ring = QPen(color_, 2)
+                painter.setPen(ring)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(QPointF(hx, hy), 7.0, 7.0)
+            else:
+                # наведение -- только цветом, размер не меняется
+                hover_pen = QPen(color_, self.POINT_SIZE_PX)
+                hover_pen.setCapStyle(Qt.RoundCap)
+                painter.setPen(hover_pen)
+                painter.drawPoint(QPointF(hx, hy))
         painter.restore()
 
     # ------------------------------------------------------------------
-    # Hover (OPT-13: sorted-X index -> O(log n) nearest-point lookup)
+    # Hover / выбор точки (OPT-13: sorted-X index -> O(log n) nearest-point lookup)
     # ------------------------------------------------------------------
+
+    def _in_kept_range(self, i: int) -> bool:
+        return self._trim_range is None or self._trim_range[0] <= i <= self._trim_range[1]
 
     def _ensure_hover_index(self):
         if self._xorder is None and len(self.pts):
             self._xorder = np.argsort(self.pts[:, 0]).astype(np.int64)
             self._xsorted = np.ascontiguousarray(self.pts[self._xorder, 0])
 
+    def _coords_text(self, i: int) -> str:
+        """Координаты вершины так, как они записаны в файле (Y вверх)."""
+        return f'X{float(self.pts[i, 0]):.3f} Y{-float(self.pts[i, 1]):.3f}'
+
     def _command_for_index(self, i: int) -> str:
         g = 'G0' if bool(self.is_travel[i]) else 'G1'
-        x, y = float(self.pts[i, 0]), float(self.pts[i, 1])
-        return f'{g} X{x:.3f} Y{-y:.3f}'
+        return f'{g} {self._coords_text(i)}'
+
+    def _points_visible(self) -> bool:
+        return self.render_mode in ('points', 'both', 'coords') and len(self.pts) > 0
+
+    def _hit_index(self, px: float, py: float):
+        """Ближайшая вершина к точке (px, py) в координатах элемента; допуск -- в пикселях экрана."""
+        if not self._points_visible():
+            return None
+        self._ensure_hover_index()
+        tol = self.HOVER_TOL_PX / self._view_scale()
+        lo = int(np.searchsorted(self._xsorted, px - tol))
+        hi = int(np.searchsorted(self._xsorted, px + tol))
+        if hi <= lo:
+            return None
+        cand = self._xorder[lo:hi]
+        if self._trim_range is not None:
+            cand = cand[(cand >= self._trim_range[0]) & (cand <= self._trim_range[1])]
+        if not len(cand):
+            return None
+        dx = self.pts[cand, 0] - px
+        dy = self.pts[cand, 1] - py
+        d2 = dx * dx + dy * dy
+        k = int(np.argmin(d2))
+        return int(cand[k]) if d2[k] < tol * tol else None
+
+    def _show_point_info(self, i, screen_pos=None):
+        """Координаты точки: в строке состояния и подсказкой рядом с курсором."""
+        mw = self._get_main_window()
+        if i is None:
+            QToolTip.hideText()
+            if mw is not None:
+                mw.statusBar().clearMessage()
+            return
+        text = self._coords_text(i)
+        line = int(self.linenos[i]) if i < len(self.linenos) else None
+        if mw is not None:
+            mw.statusBar().showMessage(text + (f'   (строка {line})' if line else ''))
+        if screen_pos is not None:
+            QToolTip.showText(screen_pos, text + (f'\nстрока {line}' if line else ''))
 
     def hoverMoveEvent(self, event):
-        if self.render_mode not in ('points', 'both', 'coords') or not len(self.pts):
+        if not self._active or not self._points_visible():
             return
-        self._ensure_hover_index()
-        px, py = event.pos().x(), event.pos().y()
-        lo = int(np.searchsorted(self._xsorted, px - 2.0))
-        hi = int(np.searchsorted(self._xsorted, px + 2.0))
-        best_marker = None
-        if hi > lo:
-            cand = self._xorder[lo:hi]
-            dx = self.pts[cand, 0] - px
-            dy = self.pts[cand, 1] - py
-            d2 = dx * dx + dy * dy
-            k = int(np.argmin(d2))
-            if d2[k] < 4.0:   # (2 scene units)^2
-                i = int(cand[k])
-                best_marker = _PointProxy(float(self.pts[i, 0]), float(self.pts[i, 1]),
-                                          self._command_for_index(i))
-
-        if best_marker is not self._hovered_marker:
-            self._hover_timer.stop()
-            self._hovered_marker = best_marker
-            if best_marker is not None:
-                self._hover_timer.start()
+        i = self._hit_index(event.pos().x(), event.pos().y())
+        if i != self._hovered_idx:
+            self._hovered_idx = i
             self.update()
+        self._show_point_info(i, event.screenPos())
 
     def hoverLeaveEvent(self, event):
-        self._hovered_marker = None
-        self._hover_timer.stop()
+        self._hovered_idx = None
+        QToolTip.hideText()
         self.update()
+
+    def contextMenuEvent(self, event):
+        """Правая кнопка на точке -- меню «Копировать координаты»."""
+        try:
+            if not self._active:
+                event.ignore()   # неактивный слой не перехватывает меню нижних слоёв
+                return
+            mw = self._get_main_window()
+            if mw is not None and (getattr(mw, 'selection_mode', False)
+                                   or time.monotonic() - getattr(mw, '_polygon_cancel_ts', 0.0) < 0.7):
+                event.ignore()   # правая кнопка только что отменила полигон
+                return
+            i = self._hit_index(event.pos().x(), event.pos().y())
+            if i is None:
+                i = self._selected_idx if self._selected_idx is not None and self._points_visible() else None
+            if i is None:
+                event.ignore()
+                return
+            self._selected_idx = i
+            self.update()
+            coords = self._coords_text(i)
+            menu = QMenu()
+            copy_xy = menu.addAction(f'Копировать координаты  ({coords})')
+            copy_cmd = menu.addAction(f'Копировать как G-code  ({self._command_for_index(i)})')
+            chosen = menu.exec_(event.screenPos())
+            if chosen is copy_xy:
+                QApplication.clipboard().setText(coords)
+            elif chosen is copy_cmd:
+                QApplication.clipboard().setText(self._command_for_index(i))
+            event.accept()
+        except Exception as e:
+            logger.error(f'Error in context menu: {e}', exc_info=True)
 
     # ------------------------------------------------------------------
     # Visual trim preview (used by GcodeTrimDialog)
@@ -478,6 +580,12 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
             removed_color = QColor(90, 90, 90)
 
         self._clear_trim_items()
+        self._trim_range = (start_idx, end_idx)
+        self._trim_hide = hide_removed
+        self._trim_color = QColor(removed_color)
+        self._trim_opacity = removed_opacity
+        self.update()
+        show_lines = self.render_mode in ('lines', 'both')
 
         if hide_removed:
             for ch in self._chunks:
@@ -489,12 +597,13 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
             self._trim_kept_draw_item = QGraphicsPathItem(kept_draw, self)
             self._trim_kept_draw_item.setPen(self.line_pen)
             self._trim_kept_draw_item.setZValue(50)
+            self._trim_kept_draw_item.setVisible(show_lines)
 
             if not kept_travel.isEmpty():
                 self._trim_kept_travel_item = QGraphicsPathItem(kept_travel, self)
                 self._trim_kept_travel_item.setPen(self.travel_pen_solid)
                 self._trim_kept_travel_item.setZValue(50)
-            if not self.show_travel and self._trim_kept_travel_item:
+            if self._trim_kept_travel_item and not (self.show_travel and show_lines):
                 self._trim_kept_travel_item.setVisible(False)
         else:
             # switching back from a previous 'hide' preview must restore chunks
@@ -520,10 +629,13 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
             pen.setCosmetic(True)
             self._trim_overlay_item.setPen(pen)
             self._trim_overlay_item.setZValue(50)
+            self._trim_overlay_item.setVisible(show_lines)
 
     def clear_trim_highlight(self):
         self._clear_trim_items()
+        self._trim_range = None
         self._restore_chunk_visibility()
+        self.update()
 
     def _restore_chunk_visibility(self):
         visible = self.render_mode in ('lines', 'both')
@@ -562,11 +674,21 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
         self.update()
 
     def set_render_mode(self, mode: str):
+        if mode == 'coords':
+            mode = 'both'   # режим «Точки с координатами» убран: координаты доступны всегда
         logger.debug(f'Render mode: {self.render_mode} -> {mode}')
         self.render_mode = mode
         trim_active = (self._trim_kept_draw_item is not None)
         if not trim_active:
             self._restore_chunk_visibility()
+        # линии предпросмотра обрезки показываем только в режимах с линиями
+        show_lines = mode in ('lines', 'both')
+        if self._trim_kept_draw_item:
+            self._trim_kept_draw_item.setVisible(show_lines)
+        if self._trim_kept_travel_item:
+            self._trim_kept_travel_item.setVisible(show_lines and self.show_travel)
+        if self._trim_overlay_item:
+            self._trim_overlay_item.setVisible(show_lines)
         self.update()
 
     def set_travel_visible(self, visible: bool):
@@ -574,7 +696,7 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
         for ch in self._chunks:
             ch.update()
         if self._trim_kept_travel_item:
-            self._trim_kept_travel_item.setVisible(visible)
+            self._trim_kept_travel_item.setVisible(visible and self.render_mode in ('lines', 'both'))
 
     def set_travel_color(self, color: QColor):
         self.travel_color = QColor(color)
@@ -591,7 +713,16 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
 
     def set_locked(self, locked: bool):
         self.setFlag(QGraphicsItem.ItemIsMovable, not locked)
-        self.setAcceptHoverEvents(not locked)
+
+    def set_active(self, active: bool):
+        """Активный слой -- тот, с которым идёт работа: только у него есть
+        наведение, выбор точки и меню; у остальных выбор сбрасывается."""
+        self._active = bool(active)
+        self.setAcceptHoverEvents(self._active)
+        if not self._active:
+            self._hovered_idx = None
+            self._selected_idx = None
+        self.update()
 
     def set_grid_lock(self, locked: bool):
         try:
@@ -605,7 +736,6 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
                 self.setScale(1.0)
                 logger.debug(f'Grid snap: ({new_x}, {new_y})')
             self.setFlag(QGraphicsItem.ItemIsMovable, not locked)
-            self.setAcceptHoverEvents(not locked)
             logger.debug(f'Grid lock set to {locked}')
         except Exception as e:
             logger.error(f'Error setting grid lock: {e}', exc_info=True)
@@ -616,6 +746,14 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            # левый клик по точке выбирает её (кольцо); клик мимо снимает выбор
+            if self._active and self._points_visible():
+                hit = self._hit_index(event.pos().x(), event.pos().y())
+                if hit != self._selected_idx:
+                    self._selected_idx = hit
+                    self.update()
+                if hit is not None:
+                    self._show_point_info(hit, event.screenPos())
             self.initial_pos = event.scenePos()
             main_window = self._get_main_window()
             if main_window is None:
@@ -671,32 +809,6 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
                     super().wheelEvent(event)
         except Exception as e:
             logger.error(f'Error in wheel event: {e}', exc_info=True)
-
-
-# ---------------------------------------------------------------------------
-# _PointProxy  (lightweight stand-in used during hover -- no QGraphicsItem)
-# ---------------------------------------------------------------------------
-
-class _PointProxy:
-    """Lightweight data holder used during hover -- no QGraphicsItem overhead."""
-    __slots__ = ('x', 'y', 'command')
-
-    def __init__(self, x: float, y: float, command: str):
-        self.x = x
-        self.y = y
-        self.command = command
-
-    def _show_hover(self):
-        """Called by GCodeGraphicsItem._on_hover_timer."""
-        from PyQt5.QtWidgets import QApplication
-        app = QApplication.instance()
-        if app is None:
-            return
-        # find main window via active QGraphicsView in focus
-        for widget in app.topLevelWidgets():
-            if hasattr(widget, 'update_coordinates'):
-                widget.update_coordinates(self.command)
-                break
 
 
 # ---------------------------------------------------------------------------
