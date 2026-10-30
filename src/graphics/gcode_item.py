@@ -116,6 +116,27 @@ def _level_selection(n, level, boundaries):
     return np.unique(np.concatenate(parts))
 
 
+def extract_segment_runs(pts, is_travel, mask):
+    """Вершины и флаги холостого хода для выделенных линий (отрезков).
+
+    Подряд идущие выделенные линии образуют серию; перед каждой серией --
+    холостой переезд (первая вершина серии помечается холостой). Возвращает
+    (индексы вершин, is_travel) -- векторно, без Python-циклов по точкам.
+    """
+    idx = np.flatnonzero(mask)
+    if not len(idx):
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=bool)
+    new_run = np.concatenate(([True], idx[1:] != idx[:-1] + 1))
+    starts = idx[new_run]
+    ends = idx[np.concatenate((new_run[1:], [True]))]
+    counts = ends - starts + 2
+    first_pos = np.cumsum(counts) - counts
+    vidx = np.repeat(starts, counts) + (np.arange(int(counts.sum())) - np.repeat(first_pos, counts))
+    trav = np.asarray(is_travel)[vidx].astype(bool)
+    trav[first_pos] = True
+    return vidx.astype(np.int64), trav
+
+
 # ---------------------------------------------------------------------------
 # Chunk child item (OPT-12: culling + per-chunk LOD)
 # ---------------------------------------------------------------------------
@@ -186,6 +207,9 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
         self._main_window = None          # OPT-8: cached main window ref
         self._hovered_idx = None          # индекс вершины под курсором
         self._active = True               # слой, с которым сейчас работают (см. set_active)
+        self._seg_sel = None              # bool-маска выделенных линий (отрезков), len = N-1
+        self._seg_anchor = None           # последняя выбранная линия (для Shift-диапазона)
+        self._seg_item = None             # подсветка выделенных линий
         self._selected_idx = None         # вершина, выбранная левой кнопкой
         self._bounding_rect = QRectF()
         self._chunks = []                 # OPT-12 chunk children
@@ -281,6 +305,7 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
             else:
                 self._bounding_rect = QRectF()
 
+            self.clear_segment_selection()
             self.clear_trim_highlight()
             self._rebuild_chunks()
 
@@ -522,26 +547,195 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
                                    or time.monotonic() - getattr(mw, '_polygon_cancel_ts', 0.0) < 0.7):
                 event.ignore()   # правая кнопка только что отменила полигон
                 return
-            i = self._hit_index(event.pos().x(), event.pos().y())
-            if i is None:
-                i = self._selected_idx if self._selected_idx is not None and self._points_visible() else None
-            if i is None:
+            px, py = event.pos().x(), event.pos().y()
+            i = self._hit_index(px, py)
+            if i is None and self._selected_idx is not None and self._points_visible():
+                i = self._selected_idx
+            if i is None and self.selected_segment_count() == 0:
+                seg = self._hit_segment(px, py) if self._lines_visible() else None
+                if seg is not None:   # правый клик по линии выделяет её
+                    self.select_segment(seg, 'replace')
+            if i is None and self.selected_segment_count() == 0:
                 event.ignore()
                 return
-            self._selected_idx = i
-            self.update()
-            coords = self._coords_text(i)
+
             menu = QMenu()
-            copy_xy = menu.addAction(f'Копировать координаты  ({coords})')
-            copy_cmd = menu.addAction(f'Копировать как G-code  ({self._command_for_index(i)})')
+            copy_xy = copy_cmd = None
+            if i is not None:
+                self._selected_idx = i
+                self.update()
+                coords = self._coords_text(i)
+                copy_xy = menu.addAction(f'Копировать координаты  ({coords})')
+                copy_cmd = menu.addAction(f'Копировать как G-code  ({self._command_for_index(i)})')
+            n_sel = self.selected_segment_count()
+            act_copy = act_cut = act_inv = act_clear = None
+            if n_sel:
+                if i is not None:
+                    menu.addSeparator()
+                act_copy = menu.addAction(f'Копировать выделенное ({n_sel} линий) в новый слой и файл…')
+                act_cut = menu.addAction(f'Вырезать выделенное ({n_sel} линий) в новый слой и файл…')
+                menu.addSeparator()
+                act_inv = menu.addAction('Инвертировать выделение')
+                act_clear = menu.addAction('Снять выделение')
             chosen = menu.exec_(event.screenPos())
-            if chosen is copy_xy:
-                QApplication.clipboard().setText(coords)
+            if chosen is None:
+                pass
+            elif chosen is copy_xy:
+                QApplication.clipboard().setText(self._coords_text(i))
             elif chosen is copy_cmd:
                 QApplication.clipboard().setText(self._command_for_index(i))
+            elif chosen is act_copy and mw is not None:
+                mw.extract_selected_lines(self.layer_ref, cut=False)
+            elif chosen is act_cut and mw is not None:
+                mw.extract_selected_lines(self.layer_ref, cut=True)
+            elif chosen is act_inv:
+                self.invert_segment_selection()
+                self._announce_selection()
+            elif chosen is act_clear:
+                self.clear_segment_selection()
+                self._announce_selection()
             event.accept()
         except Exception as e:
             logger.error(f'Error in context menu: {e}', exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Выделение линий (штрихов): клик, Shift -- подряд, Ctrl -- выборочно,
+    # двойной клик -- весь блок штрихов (между подъёмами инструмента).
+    # Линия i -- отрезок между вершинами i и i+1.
+    # ------------------------------------------------------------------
+
+    def segment_count(self) -> int:
+        return max(0, len(self.pts) - 1)
+
+    def selected_segment_count(self) -> int:
+        return int(self._seg_sel.sum()) if self._seg_sel is not None else 0
+
+    def segment_mask(self):
+        """Копия маски выделенных линий или None."""
+        if self._seg_sel is None or not self._seg_sel.any():
+            return None
+        return self._seg_sel.copy()
+
+    def _ensure_seg_sel(self):
+        if self._seg_sel is None or len(self._seg_sel) != self.segment_count():
+            self._seg_sel = np.zeros(self.segment_count(), dtype=bool)
+
+    def _lines_visible(self) -> bool:
+        return self.render_mode in ('lines', 'both') and self.segment_count() > 0
+
+    def _hit_segment(self, px: float, py: float):
+        """Ближайшая линия к точке (px, py); допуск -- в пикселях экрана."""
+        if not self._lines_visible():
+            return None
+        tol = self.HOVER_TOL_PX / self._view_scale()
+        pts = self.pts
+        x0, x1 = pts[:-1, 0], pts[1:, 0]
+        y0, y1 = pts[:-1, 1], pts[1:, 1]
+        m = ((np.minimum(x0, x1) <= px + tol) & (np.maximum(x0, x1) >= px - tol) &
+             (np.minimum(y0, y1) <= py + tol) & (np.maximum(y0, y1) >= py - tol))
+        if not self.show_travel:
+            m &= ~self.is_travel[1:]
+        if self._trim_range is not None:
+            lo, hi = self._trim_range
+            m[:lo] = False
+            m[hi:] = False
+        cand = np.flatnonzero(m)
+        if not len(cand):
+            return None
+        ax, ay = x0[cand].astype(np.float64), y0[cand].astype(np.float64)
+        dx, dy = x1[cand] - ax, y1[cand] - ay
+        l2 = dx * dx + dy * dy
+        t = np.clip(((px - ax) * dx + (py - ay) * dy) / np.where(l2 > 0, l2, 1.0), 0.0, 1.0)
+        d2 = (ax + t * dx - px) ** 2 + (ay + t * dy - py) ** 2
+        k = int(np.argmin(d2))
+        return int(cand[k]) if d2[k] <= tol * tol else None
+
+    def block_range(self, i: int):
+        """(first, last) линии блока: подряд идущие линии одного типа
+        (штрихи между подъёмами инструмента либо холостые ходы)."""
+        t = self.is_travel[1:]
+        starts = np.flatnonzero(np.concatenate(([True], t[1:] != t[:-1])))
+        k = int(np.searchsorted(starts, i, side='right')) - 1
+        first = int(starts[k])
+        last = int(starts[k + 1]) - 1 if k + 1 < len(starts) else len(t) - 1
+        return first, last
+
+    def select_segment(self, i: int, mode: str = 'replace'):
+        """mode: 'replace' -- одна линия, 'range' (Shift) -- подряд от прошлой, 'toggle' (Ctrl) -- выборочно."""
+        self._ensure_seg_sel()
+        if mode == 'replace':
+            self._seg_sel[:] = False
+            self._seg_sel[i] = True
+        elif mode == 'range':
+            a = self._seg_anchor if self._seg_anchor is not None else i
+            lo, hi = min(a, i), max(a, i)
+            self._seg_sel[lo:hi + 1] = True
+        else:
+            self._seg_sel[i] = not self._seg_sel[i]
+        self._seg_anchor = i
+        self._update_seg_item()
+
+    def select_block(self, i: int, add: bool = False):
+        self._ensure_seg_sel()
+        first, last = self.block_range(i)
+        if not add:
+            self._seg_sel[:] = False
+        self._seg_sel[first:last + 1] = True
+        self._seg_anchor = i
+        self._update_seg_item()
+
+    def invert_segment_selection(self):
+        self._ensure_seg_sel()
+        self._seg_sel = ~self._seg_sel
+        self._update_seg_item()
+
+    def set_segment_mask(self, mask):
+        self._seg_sel = None if mask is None else np.asarray(mask, dtype=bool).copy()
+        self._seg_anchor = None
+        self._update_seg_item()
+
+    def clear_segment_selection(self):
+        self._seg_sel = None
+        self._seg_anchor = None
+        self._update_seg_item()
+
+    def _update_seg_item(self):
+        if self._seg_item is not None:
+            self._remove_scene_item(self._seg_item)
+            self._seg_item = None
+        if self._seg_sel is None or not self._seg_sel.any():
+            self.update()
+            return
+        from PyQt5.QtWidgets import QGraphicsPathItem
+        idx = np.flatnonzero(self._seg_sel).astype(np.int64)
+        path = _records_to_qpath(_spans_to_records(self.pts, idx, idx + 1))
+        self._seg_item = QGraphicsPathItem(path, self)
+        pen = QPen(QColor(255, 150, 0), 3)
+        pen.setCosmetic(True)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        self._seg_item.setPen(pen)
+        self._seg_item.setZValue(60)
+        self._seg_item.setAcceptedMouseButtons(Qt.NoButton)
+        self.update()
+
+    def _announce_selection(self):
+        mw = self._get_main_window()
+        n = self.selected_segment_count()
+        if mw is not None:
+            mw.statusBar().showMessage(
+                f'Выделено линий: {n}. Правая кнопка — копировать или вырезать в новый слой.' if n
+                else 'Выделение снято')
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton and self._active and self._lines_visible():
+            i = self._hit_segment(event.pos().x(), event.pos().y())
+            if i is not None:
+                self.select_block(i, add=bool(event.modifiers() & Qt.ControlModifier))
+                self._announce_selection()
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     # ------------------------------------------------------------------
     # Visual trim preview (used by GcodeTrimDialog)
@@ -722,6 +916,7 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
         if not self._active:
             self._hovered_idx = None
             self._selected_idx = None
+            self.clear_segment_selection()
         self.update()
 
     def set_grid_lock(self, locked: bool):
@@ -746,14 +941,30 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            # левый клик по точке выбирает её (кольцо); клик мимо снимает выбор
-            if self._active and self._points_visible():
-                hit = self._hit_index(event.pos().x(), event.pos().y())
-                if hit != self._selected_idx:
-                    self._selected_idx = hit
-                    self.update()
+            # левый клик: точка (кольцо) -- если попали в неё, иначе линия (штрих);
+            # Shift -- линии подряд, Ctrl -- выборочно; клик мимо снимает выбор
+            if self._active:
+                px, py = event.pos().x(), event.pos().y()
+                mods = event.modifiers()
+                hit = self._hit_index(px, py) if self._points_visible() else None
                 if hit is not None:
+                    if hit != self._selected_idx:
+                        self._selected_idx = hit
+                        self.update()
                     self._show_point_info(hit, event.screenPos())
+                else:
+                    seg = self._hit_segment(px, py) if self._lines_visible() else None
+                    if seg is not None:
+                        mode = 'range' if mods & Qt.ShiftModifier else ('toggle' if mods & Qt.ControlModifier else 'replace')
+                        self.select_segment(seg, mode)
+                        self._selected_idx = None
+                        self._announce_selection()
+                    elif not (mods & (Qt.ShiftModifier | Qt.ControlModifier)):
+                        self._selected_idx = None
+                        if self._seg_sel is not None:
+                            self.clear_segment_selection()
+                            self._announce_selection()
+                        self.update()
             self.initial_pos = event.scenePos()
             main_window = self._get_main_window()
             if main_window is None:

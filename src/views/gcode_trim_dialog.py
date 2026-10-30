@@ -3,10 +3,11 @@
 portion of the loaded G-code, watching the cut live on the canvas."""
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton,
-    QPlainTextEdit, QFileDialog, QRadioButton, QColorDialog
+    QPlainTextEdit, QFileDialog, QRadioButton, QColorDialog, QMenu
 )
 from PyQt5.QtGui import QTextCursor, QColor
 from PyQt5.QtCore import Qt, QSettings
+import numpy as np
 import logging
 
 logger = logging.getLogger(__name__)
@@ -97,13 +98,22 @@ class GcodeTrimDialog(QDialog):
         buttons_row = QHBoxLayout()
         self.save_btn = QPushButton("Сохранить выделенное...")
         self.save_btn.clicked.connect(self._on_save)
+        self.copy_btn = QPushButton("Копировать в новый слой ▾")
+        self.cut_btn = QPushButton("Вырезать в новый слой ▾")
+        for btn, cut in ((self.copy_btn, False), (self.cut_btn, True)):
+            menu = QMenu(btn)
+            menu.addAction("Оставляемый фрагмент", lambda c=cut: self._extract(c, kept=True))
+            menu.addAction("Отрезанные начало и конец", lambda c=cut: self._extract(c, kept=False))
+            btn.setMenu(menu)
         close_btn = QPushButton("Закрыть")
         close_btn.clicked.connect(self.close)
         buttons_row.addWidget(self.save_btn)
+        buttons_row.addWidget(self.copy_btn)
+        buttons_row.addWidget(self.cut_btn)
         buttons_row.addWidget(close_btn)
         layout.addLayout(buttons_row)
 
-        self.resize(560, 200)
+        self.resize(700, 200)
 
     # ------------------------------------------------------------------
     # Live preview
@@ -209,6 +219,32 @@ class GcodeTrimDialog(QDialog):
     # ------------------------------------------------------------------
     # Save / close
     # ------------------------------------------------------------------
+
+    def _extract(self, cut: bool, kept: bool):
+        """Копировать/вырезать оставляемый фрагмент (kept) либо отрезанные концы."""
+        try:
+            item = self.layer.current_item
+            if not item or item.point_count() < 2:
+                return
+            mw = self.parent().window()
+            layer = self.layer
+            if item.render_mode == 'points':
+                # режим «Точки»: режем именно точки диапазона, линии не учитываем
+                vmask = np.zeros(item.point_count(), dtype=bool)
+                vmask[self.start_slider.value():self._end_index() + 1] = True
+                if not kept:
+                    vmask = ~vmask
+                self.close()
+                mw.extract_selected_lines(layer, cut=cut, vertex_mask=vmask)
+                return
+            mask = np.zeros(item.segment_count(), dtype=bool)
+            mask[self.start_slider.value():self._end_index()] = True   # линии между точками start..end
+            if not kept:
+                mask = ~mask
+            self.close()   # снимает предпросмотр обрезки
+            mw.extract_selected_lines(layer, cut=cut, mask=mask)
+        except Exception as e:
+            logger.error(f"Error extracting trim range: {e}", exc_info=True)
 
     def _on_save(self):
         try:

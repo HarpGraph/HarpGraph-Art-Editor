@@ -330,6 +330,22 @@ class GCodeLayer(BaseLayer):
             self.load_finished.emit(False)
             return
 
+        self._install_item(points, is_travel, linenos)
+        logger.debug(f'Async load done: {self.file_path}')
+        self.load_finished.emit(True)
+
+    def load_arrays(self, points, is_travel, linenos=None):
+        """Создать содержимое слоя из готовых массивов (координаты файла, Y вверх)
+        -- для слоёв, полученных вырезанием/копированием выделенного."""
+        if self.current_item:
+            self.scene.removeItem(self.current_item)
+            self.current_item = None
+            self._items.clear()
+        self._load_generation += 1
+        self._install_item(points, is_travel, linenos)
+        self.load_finished.emit(True)
+
+    def _install_item(self, points, is_travel, linenos):
         self.current_item = GCodeGraphicsItem()
         self.current_item.set_gcode_data(points, is_travel, linenos)
         self.current_item.set_line_color(self.line_color)
@@ -346,9 +362,6 @@ class GCodeLayer(BaseLayer):
         if self.scale_x != 1.0 or self.scale_y != 1.0:
             from PyQt5.QtGui import QTransform
             self.current_item.setTransform(QTransform().scale(self.scale_x, self.scale_y))
-
-        logger.debug(f'Async load done: {self.file_path}')
-        self.load_finished.emit(True)
 
     def _on_parse_error(self, error_msg: str, generation: int, worker=None):
         """Called in the GUI thread when background parse fails."""

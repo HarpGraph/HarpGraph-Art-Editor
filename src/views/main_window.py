@@ -5,20 +5,24 @@ from PyQt5.QtWidgets import (QMainWindow, QDockWidget, QListWidget,
                            QLineEdit, QPushButton, QHBoxLayout,
                            QApplication, QSpinBox, QMessageBox,
                            QColorDialog, QDialog, QFormLayout, QScrollArea,
-                           QGraphicsEllipseItem, QFrame)
+                           QGraphicsEllipseItem, QFrame, QMenu)
 from PyQt5.QtCore import Qt, QSettings, QPointF, QRectF, QEvent  # Добавляем QSettings
-from PyQt5.QtGui import QPainter, QColor, QPolygonF, QPen, QBrush, QPainterPath
+from PyQt5.QtGui import QPainter, QColor, QPolygonF, QPen, QBrush, QPainterPath, QCursor
 from src.views.layer_dialog import NewLayerDialog
 from src.views.image_size_dialog import ImageSizeDialog
 from src.views.svg_size_dialog import SvgSizeDialog
 from src.models.layer_types import LayerType
 from src.models.base_layer import BaseLayer
 from .layer_widget import LayerWidget  # Добавляем импорт LayerWidget
+from .layer_list import LayerListWidget
 from src.graphics.grid_item import GridItem  # Добавляем импорт GridItem
 from .grid_settings_dialog import GridSettingsDialog  # Добавить в импорты
 import numpy as np
 import logging
+import os
 import time
+from src.graphics.gcode_item import extract_segment_runs
+from src.models.block_select import select_blocks_by_area
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,9 @@ class MainWindow(QMainWindow):
         self.field_w_mm = 400.0
         self.field_h_mm = 400.0
         self.field_bg_color = QColor(Qt.white)
+        # выделение областью: целыми блоками штрихов, допуск (мм) у границы
+        self.area_block_mode = self.settings.value('area/block_mode', False, type=bool)
+        self.area_tol_mm = self.settings.value('area/tol_mm', 1.0, type=float)
         self.field_rect_item = None
         self.field_fill_item = None
         self.setup_ui()
@@ -65,6 +72,8 @@ class MainWindow(QMainWindow):
         self.selection_marker_item = None
         self.selection_layer = None
         self.selection_cursor = None
+        self.selection_kind = None      # 'polygon' | 'rect'
+        self.rect_start = None
         self._polygon_cancel_ts = 0.0   # время последней отмены полигона правой кнопкой
         self._prev_drag_mode = None
         self.scene.installEventFilter(self)
@@ -637,7 +646,9 @@ class MainWindow(QMainWindow):
 
             # Добавляем слой в список
             self.layers.append(layer)
-
+            # глазик/замок в списке слоёв перерисовываются при любом изменении слоя
+            layer.visibility_changed.connect(lambda _v: self.layer_list.viewport().update())
+            layer.locked_changed.connect(lambda _v: self.layer_list.viewport().update())
             # Элемент G-code/SVG слоя появляется только после фоновой загрузки --
             # тогда же нужно выставить порядок слоёв (Z) и активный слой
             load_sig = getattr(layer, 'load_finished', None)
@@ -658,11 +669,31 @@ class MainWindow(QMainWindow):
             logger.error(f"Error creating layer: {e}")
             return None
 
+    def start_rect_selection(self, layer=None):
+        """Режим выделения рамкой: зажать левую кнопку и потянуть."""
+        try:
+            self.cancel_polygon_selection()
+            self.selection_layer = layer
+            self.selection_kind = 'rect'
+            self.selection_mode = True
+            self.rect_start = None
+            self._prev_drag_mode = self.view.dragMode()
+            self.view.setDragMode(QGraphicsView.NoDrag)
+            self.view.setCursor(Qt.CrossCursor)
+            self.view.setFocus()
+            self.statusBar().showMessage(
+                "Рамка: зажмите левую кнопку и потяните | Esc или правая кнопка — отмена"
+                " | режим «Точки» — режутся точки, «Линии»/«Линии и точки» — целые линии")
+        except Exception as e:
+            logger.error(f"Error starting rect selection: {e}", exc_info=True)
+            self.cancel_polygon_selection()
+
     def start_polygon_selection(self, layer=None):
         """Режим рисования полигона для слоя `layer` (запускается из панели слоя)."""
         try:
             self.cancel_polygon_selection()
             self.selection_layer = layer
+            self.selection_kind = 'polygon'
             self.selection_mode = True
             self.selection_points = []
             self.selection_cursor = None
@@ -693,6 +724,8 @@ class MainWindow(QMainWindow):
     def cancel_polygon_selection(self):
         try:
             self.selection_mode = False
+            self.selection_kind = None
+            self.rect_start = None
             self.selection_points = []
             self.selection_cursor = None
             for name in ('selection_path_item', 'selection_marker_item'):
@@ -717,9 +750,21 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(main_widget)
         
         # Создаем список слоев
-        self.layer_list = QListWidget()
+        # Список слоёв как в Photoshop: глазик, замок, кнопки вверх/вниз
+        self.layer_list = LayerListWidget()
         self.layer_list.setSelectionMode(QListWidget.ExtendedSelection)
         main_layout.addWidget(self.layer_list)
+
+        buttons_row = QHBoxLayout()
+        for text, tip, slot in (
+                ("▲", "Слой выше", lambda: self.move_layer(-1)),
+                ("▼", "Слой ниже", lambda: self.move_layer(1)),
+                ("Удалить слой", "Удалить выбранные слои", self.delete_selected_layers)):
+            btn = QPushButton(text)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            buttons_row.addWidget(btn)
+        main_layout.addLayout(buttons_row)
         
         # Создаем контейнер для виджета слоя
         # Панель слоя может быть выше окна -- даём прокрутку, чтобы все настройки были достижимы
@@ -794,7 +839,10 @@ class MainWindow(QMainWindow):
                 if obj.cursor().shape() in (Qt.OpenHandCursor, Qt.ClosedHandCursor):
                     obj.setCursor(Qt.ArrowCursor)
                 return False
-            if self.selection_mode:
+            if self.selection_mode and self.selection_kind == 'rect':
+                if self._rect_event(event):
+                    return True
+            elif self.selection_mode:
                 etype = event.type()
                 if etype == QEvent.GraphicsSceneMousePress:
                     if event.button() == Qt.LeftButton:
@@ -823,8 +871,9 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event):
         if self.selection_mode:
             key = event.key()
+            polygon = self.selection_kind == 'polygon'
             if key in (Qt.Key_Return, Qt.Key_Enter):
-                if len(self.selection_points) >= 3:
+                if polygon and len(self.selection_points) >= 3:
                     self.finalize_polygon_selection()
                 event.accept()
                 return
@@ -833,7 +882,7 @@ class MainWindow(QMainWindow):
                 event.accept()
                 return
             if key == Qt.Key_Backspace:
-                if self.selection_points:
+                if polygon and self.selection_points:
                     self.selection_points.pop()
                     self.update_selection_path()
                 event.accept()
@@ -860,7 +909,46 @@ class MainWindow(QMainWindow):
         self.cancel_polygon_selection()
         if len(points) < 3:
             return
-        self.save_points_in_polygon(QPolygonF(points), layer)
+        poly = np.array([[p.x(), p.y()] for p in points], dtype=np.float64)
+        self._apply_area_selection(layer, poly)
+
+    def _rect_event(self, event):
+        """Рамка: зажать левую кнопку и потянуть. True -- событие обработано."""
+        etype = event.type()
+        if etype == QEvent.GraphicsSceneMousePress:
+            if event.button() == Qt.LeftButton:
+                self.rect_start = event.scenePos()
+                if self.selection_path_item is None:
+                    pen = QPen(Qt.red, 0)
+                    pen.setStyle(Qt.DashLine)
+                    self.selection_path_item = self.scene.addRect(QRectF(), pen, QBrush(QColor(255, 0, 0, 30)))
+                    self.selection_path_item.setZValue(10000)
+                self.selection_path_item.setRect(QRectF(self.rect_start, self.rect_start))
+                return True
+            if event.button() == Qt.RightButton:
+                self._polygon_cancel_ts = time.monotonic()
+                self.cancel_polygon_selection()
+                return True
+        elif etype == QEvent.GraphicsSceneMouseMove:
+            if self.rect_start is not None and self.selection_path_item is not None:
+                self.selection_path_item.setRect(QRectF(self.rect_start, event.scenePos()).normalized())
+        elif etype == QEvent.GraphicsSceneMouseRelease:
+            if event.button() == Qt.LeftButton and self.rect_start is not None:
+                rect = QRectF(self.rect_start, event.scenePos()).normalized()
+                scale = self.view.transform().m11()
+                self.rect_start = None
+                if rect.width() * scale < 4 or rect.height() * scale < 4:
+                    self.selection_path_item.setRect(QRectF())   # случайный клик -- ждём рамку дальше
+                    return True
+                layer = self.selection_layer
+                self.cancel_polygon_selection()
+                poly = np.array([[rect.left(), rect.top()], [rect.right(), rect.top()],
+                                 [rect.right(), rect.bottom()], [rect.left(), rect.bottom()]], dtype=np.float64)
+                self._apply_area_selection(layer, poly)
+                return True
+        elif etype == QEvent.GraphicsSceneMouseDoubleClick:
+            return True
+        return False
 
     def load_file_to_layer(self):
         try:
@@ -977,52 +1065,240 @@ class MainWindow(QMainWindow):
             self.on_layer_selected(current_item, None)
         logger.debug(f"View scaled to: {scale}, grid visible: {grid_visible}")
 
-    def save_points_in_polygon(self, polygon: QPolygonF, layer=None):
-        """Сохранить точки G-code внутри полигона. `layer` -- слой, из панели которого
-        запущено выделение; без него берутся все видимые G-code слои."""
+    def set_area_options(self, block_mode=None, tol_mm=None):
+        if block_mode is not None:
+            self.area_block_mode = bool(block_mode)
+            self.settings.setValue('area/block_mode', self.area_block_mode)
+        if tol_mm is not None:
+            self.area_tol_mm = float(tol_mm)
+            self.settings.setValue('area/tol_mm', self.area_tol_mm)
+
+    def _apply_point_area(self, layer, inside):
+        """Режим «Точки»: линии не учитываются, режутся именно точки в области."""
+        n_in = int(inside.sum())
+        n_out = int(len(inside) - n_in)
+        if n_in == 0:
+            QMessageBox.information(self, "Выделение", "Внутри области нет ни одной точки.")
+            return
+        menu = QMenu(self)
+        acts = {
+            menu.addAction(f"Копировать внутренние точки ({n_in}) в новый слой и файл…"): (inside, False),
+            menu.addAction(f"Вырезать внутренние точки ({n_in}) в новый слой и файл…"): (inside, True),
+        }
+        if n_out:
+            menu.addSeparator()
+            acts[menu.addAction(f"Копировать наружные точки ({n_out}) в новый слой и файл…")] = (~inside, False)
+            acts[menu.addAction(f"Вырезать наружные точки ({n_out}) в новый слой и файл…")] = (~inside, True)
+        chosen = menu.exec_(QCursor.pos())
+        if chosen in acts:
+            vmask, cut = acts[chosen]
+            self.extract_selected_lines(layer, cut=cut, vertex_mask=vmask)
+
+    def _apply_area_selection(self, layer, poly_xy):
+        """Линии слоя, целиком попавшие в область (полигон/рамка, сцена), -> выделение;
+        сразу предлагаем копировать/вырезать внутреннее или наружное."""
         try:
+            item = getattr(layer, 'current_item', None)
+            if item is None or item.point_count() < 2:
+                return
+            pts = item.pts
+            tr = item.sceneTransform()
+            xs = pts[:, 0] * tr.m11() + pts[:, 1] * tr.m21() + tr.dx()
+            ys = pts[:, 0] * tr.m12() + pts[:, 1] * tr.m22() + tr.dy()
+            inside = _points_in_polygon(xs, ys, poly_xy)
+            if item.render_mode == 'points':
+                self._apply_point_area(layer, inside)
+                return
+            if self.area_block_mode:
+                res = select_blocks_by_area(xs, ys, item.is_travel, poly_xy, self.area_tol_mm, _points_in_polygon)
+                if res is None:
+                    QMessageBox.information(self, "Выделение", "В слое нет рабочих линий (штрихов).")
+                    return
+                in_mask, out_mask, b_in, b_out, b_split = res
+                unit_in = f"{b_in} блоков, {int(in_mask.sum())} линий"
+                unit_out = f"{b_out} блоков, {int(out_mask.sum())} линий"
+                note = f" (граница пересекла блоков: {b_split}, они не перерезаны)" if b_split else ""
+            else:
+                in_mask = inside[:-1] & inside[1:]
+                out_mask = ~in_mask
+                unit_in = f"{int(in_mask.sum())} линий"
+                unit_out = f"{int(out_mask.sum())} линий"
+                note = ""
+            n_in, n_out = int(in_mask.sum()), int(out_mask.sum())
+            if n_in == 0:
+                QMessageBox.information(self, "Выделение", "Внутри области нет ни одной целой линии." if not self.area_block_mode
+                                        else "Внутри области нет ни одного блока штрихов.")
+                return
+            item.set_segment_mask(in_mask)
+            menu = QMenu(self)
+            acts = {
+                menu.addAction(f"Копировать внутреннее ({unit_in}) в новый слой и файл…"): (in_mask, out_mask, False),
+                menu.addAction(f"Вырезать внутреннее ({unit_in}) в новый слой и файл…"): (in_mask, out_mask, True),
+            }
+            if n_out:
+                menu.addSeparator()
+                acts[menu.addAction(f"Копировать наружное ({unit_out}) в новый слой и файл…")] = (out_mask, in_mask, False)
+                acts[menu.addAction(f"Вырезать наружное ({unit_out}) в новый слой и файл…")] = (out_mask, in_mask, True)
+            menu.addSeparator()
+            keep_in = menu.addAction("Только выделить внутреннее")
+            keep_out = menu.addAction("Только выделить наружное") if n_out else None
+            if note:
+                self.statusBar().showMessage("Блоки штрихов целиком" + note)
+            chosen = menu.exec_(QCursor.pos())
+            if chosen in acts:
+                sel_mask, rest_mask, cut = acts[chosen]
+                self.extract_selected_lines(layer, cut=cut, mask=sel_mask, rest_mask=rest_mask)
+            elif chosen is keep_out:
+                item.set_segment_mask(out_mask)
+                item._announce_selection()
+            elif chosen is keep_in:
+                item._announce_selection()
+            else:
+                item.clear_segment_selection()
+        except Exception as e:
+            logger.error(f"Error applying area selection: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Копировать / вырезать выделенные линии в новый слой и файл
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _write_gcode_vertices(filename, pts_display, is_travel):
+        """Чистый G0/G1 по вершинам; pts_display -- экранные координаты (Y вниз)."""
+        xs = pts_display[:, 0].astype(np.float64)
+        ys = -pts_display[:, 1].astype(np.float64)
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(
+                f"{'G0' if t else 'G1'} X{x:.3f} Y{y:.3f}"
+                for t, x, y in zip(is_travel.tolist(), xs.tolist(), ys.tolist())))
+            f.write('\n')
+
+    def _add_gcode_layer_from_arrays(self, src_layer, name, pts_display, is_travel, filename,
+                                     visible=True, line_color=None):
+        """Новый G-code слой с тем же видом/положением, что у исходного, прямо над ним."""
+        new = self.add_layer(name, LayerType.GCODE)
+        if new is None:
+            return None
+        for attr in ('line_color', 'point_color', 'travel_color'):
+            setattr(new, attr, QColor(getattr(src_layer, attr)))
+        if line_color is not None:
+            new.line_color = QColor(line_color)
+        new.travel_z = src_layer.travel_z
+        new.show_travel = src_layer.show_travel
+        new.file_path = filename
+        file_pts = np.column_stack((pts_display[:, 0], -pts_display[:, 1]))
+        new.load_arrays(file_pts, is_travel, np.arange(1, len(file_pts) + 1, dtype=np.int32))
+        src_item, item = src_layer.current_item, new.current_item
+        item.setPos(src_item.pos())
+        item.setTransform(src_item.transform())
+        new.scale_x, new.scale_y = src_item.transform().m11(), src_item.transform().m22()
+        item.set_render_mode(src_item.render_mode)
+        new.visible = visible
+
+        src_row = next((r for r in range(self.layer_list.count())
+                        if self.layer_list.item(r).data(Qt.UserRole) is src_layer), 0)
+        list_item = self.layer_list.takeItem(self.layer_list.count() - 1)
+        self.layer_list.insertItem(src_row, list_item)
+        self.layers.remove(new)
+        self.layers.insert(src_row, new)
+        self.update_layer_item_text(list_item, new)
+        self.update_layers_z_values()
+        self.layer_list.clearSelection()
+        self.layer_list.setCurrentItem(list_item)
+        list_item.setSelected(True)
+        self._update_scene_bounds()
+        return new
+
+    @staticmethod
+    def _part_arrays(item, line_mask, vertex_mask, invert=False, rest_mask=None):
+        """Вершины и флаги холостого хода части слоя: по маске линий (целые линии)
+        либо по маске вершин (режим «Точки» -- линии не учитываются)."""
+        if vertex_mask is not None:
+            vm = ~vertex_mask if invert else vertex_mask
+            vidx = np.flatnonzero(vm)
+            return vidx, np.asarray(item.is_travel)[vidx].astype(bool)
+        if invert:
+            line_mask = rest_mask if rest_mask is not None else ~line_mask
+        return extract_segment_runs(item.pts, item.is_travel, line_mask)
+
+    def extract_selected_lines(self, layer, cut: bool = False, mask=None, vertex_mask=None, rest_mask=None):
+        """Линии (или точки) -> новый слой + G-code файл. cut=True -- ещё и убрать их из слоя.
+        mask -- маска линий (иначе берётся текущее выделение слоя); vertex_mask -- маска
+        точек: тогда на линии между ними внимания не обращаем; rest_mask -- что считать
+        остатком (по умолчанию всё, что не в mask)."""
+        try:
+            item = getattr(layer, 'current_item', None)
+            if vertex_mask is None and mask is None:
+                mask = item.segment_mask() if item is not None else None
+            what = 'точек' if vertex_mask is not None else 'линий'
+            count = int(vertex_mask.sum()) if vertex_mask is not None else (int(mask.sum()) if mask is not None else 0)
+            if count == 0:
+                QMessageBox.information(self, "Выделение", "Нечего копировать или вырезать. Выделите линии кликом по ним (Shift — подряд, Ctrl — выборочно) либо областью.")
+                return
+            base = os.path.splitext(layer.file_path)[0] if getattr(layer, 'file_path', None) else layer.name
             filename, _ = QFileDialog.getSaveFileName(
-                self,
-                "Сохранить отфильтрованный G-code",
-                "",
-                "G-code files (*.gcode);;All files (*.*)"
-            )
+                self, "Сохранить вырезанное" if cut else "Сохранить копию выделенного",
+                f"{base}_{'cut' if cut else 'copy'}.gcode",
+                "G-code files (*.gcode);;All files (*.*)")
             if not filename:
                 return
+            vidx, trav = self._part_arrays(item, mask, vertex_mask)
+            pts = item.pts[vidx]
+            # вторая часть слоя -- остаток -- сохраняется всегда: файл рядом + слой/исходный слой
+            rest_vidx, rest_trav = self._part_arrays(item, mask, vertex_mask, invert=True, rest_mask=rest_mask)
+            rest_pts = item.pts[rest_vidx]
+            rest_file = None
+            if len(rest_vidx):
+                rest_file = self._unique_path(os.path.splitext(filename)[0] + '_rest.gcode')
+                self._write_gcode_vertices(rest_file, rest_pts, rest_trav)
+            self._write_gcode_vertices(filename, pts, trav)
 
-            poly = np.array([[p.x(), p.y()] for p in polygon], dtype=np.float64)
-            total = 0
-            source_layers = [layer] if layer is not None else self.layers
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write("; Filtered G-code from selection\n")
-                for layer in source_layers:
-                    if not (getattr(layer, 'visible', True) and layer.type == LayerType.GCODE
-                            and getattr(layer, 'current_item', None)):
-                        continue
-                    item = layer.current_item
-                    pts = getattr(item, 'pts', None)
-                    if pts is None or len(pts) == 0:
-                        continue
-                    # OPT-11: аффинное преобразование и проверка полигона -- numpy,
-                    # без mapToScene на каждую точку
-                    tr = item.sceneTransform()
-                    xs = pts[:, 0] * tr.m11() + pts[:, 1] * tr.m21() + tr.dx()
-                    ys = pts[:, 0] * tr.m12() + pts[:, 1] * tr.m22() + tr.dy()
-                    idx = np.nonzero(_points_in_polygon(xs, ys, poly))[0]
-                    trav = item.is_travel
-                    for i in idx:
-                        g = 'G0' if bool(trav[i]) else 'G1'
-                        f.write(f"{g} X{pts[i, 0]:.3f} Y{-pts[i, 1]:.3f}\n")
-                    total += len(idx)
-
-            if total == 0:
-                logger.debug("No points found inside polygon")
-                QMessageBox.information(self, "Выделение",
-                                        "Внутри полигона не найдено ни одной точки")
-                return
-            logger.debug(f"Saved {total} commands to {filename}")
+            new_name = f"{layer.name} — {'вырезано' if cut else 'копия'}"
+            rest_name = f"{layer.name} — остаток"
+            logger.debug(f"Extracted {count} {what} to {filename} (cut={cut}), rest -> {rest_file}")
+            if cut:
+                self._add_gcode_layer_from_arrays(layer, new_name, pts, trav, filename)
+                self._replace_layer_content(layer, rest_pts, rest_trav, rest_file)
+                tail = (f"остаток ({len(rest_vidx)}) остался в исходном слое и в файле {rest_file}"
+                        if rest_file else "в исходном слое ничего не осталось")
+            else:
+                if rest_file:
+                    # остаток -- отдельным скрытым слоем другого цвета (включается глазиком)
+                    self._add_gcode_layer_from_arrays(layer, rest_name, rest_pts, rest_trav, rest_file,
+                                                      visible=False, line_color='#0050ff')
+                self._add_gcode_layer_from_arrays(layer, new_name, pts, trav, filename)
+                tail = (f"остаток ({len(rest_vidx)}) лежит в скрытом слое «{rest_name}» и в файле {rest_file}"
+                        if rest_file else "остатка нет")
+            self.statusBar().showMessage(
+                f"{'Вырезано' if cut else 'Скопировано'} {what}: {count} → слой «{new_name}», файл {filename}; {tail}")
         except Exception as e:
-            logger.error(f"Error saving points in polygon: {e}", exc_info=True)
+            logger.error(f"Error extracting selected lines: {e}", exc_info=True)
+            QMessageBox.warning(self, "Выделение", f"Не удалось выполнить: {e}")
+
+    @staticmethod
+    def _unique_path(path):
+        """Не затираем существующий файл: добавляем _2, _3, ..."""
+        root, ext = os.path.splitext(path)
+        candidate, n = path, 2
+        while os.path.exists(candidate):
+            candidate = f"{root}_{n}{ext}"
+            n += 1
+        return candidate
+
+    def _replace_layer_content(self, layer, pts_display, trav, filename):
+        """Оставить в слое только переданные вершины; слой привязывается к файлу остатка."""
+        item = layer.current_item
+        pos, tr = item.pos(), item.transform()
+        file_pts = np.column_stack((pts_display[:, 0], -pts_display[:, 1]))
+        item.set_gcode_data(file_pts, trav, np.arange(1, len(file_pts) + 1, dtype=np.int32))
+        item.setPos(pos)
+        item.setTransform(tr)
+        layer.file_path = filename   # номера строк теперь соответствуют файлу остатка
+        for r in range(self.layer_list.count()):
+            li = self.layer_list.item(r)
+            if li.data(Qt.UserRole) is layer:
+                self.update_layer_item_text(li, layer)
+        self._update_scene_bounds()
 
     def scale_view(self, factor):
         """Масштабирование вида и сетки -- с пределами, чтобы нельзя было

@@ -1,6 +1,6 @@
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QCheckBox, QGroupBox, QRadioButton,
                              QPushButton, QColorDialog, QDoubleSpinBox, QFileDialog, QComboBox)
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QSettings
 import logging
 from ..models.base_layer import BaseLayer
 from ..models.gcode_layer import GCodeLayer
@@ -29,30 +29,10 @@ class LayerWidget(QWidget):
             layout = QVBoxLayout(self)
             layout.setContentsMargins(2, 2, 2, 2)
 
-            # Верхняя строка с именем и чекбоксами
-            top_row = QHBoxLayout()
-
-            # Чекбокс видимости
-            self.visibility_cb = QCheckBox()
-            self.visibility_cb.setToolTip("Видимость слоя")
-            self.visibility_cb.setChecked(self.layer.visible)
-            self.visibility_cb.toggled.connect(self.on_visibility_changed)
-
-            # Чекбокс блокировки
-            self.lock_cb = QCheckBox()
-            self.lock_cb.setToolTip("Блокировка слоя")
-            self.lock_cb.setChecked(self.layer.locked)
-            self.lock_cb.toggled.connect(self.on_lock_changed)
-
-            # Имя слоя
+            # Видимость и блокировка слоя -- в списке слоёв (глазик и замок);
+            # здесь только имя
             name_label = QLabel(self.layer.name)
-
-            top_row.addWidget(self.visibility_cb)
-            top_row.addWidget(self.lock_cb)
-            top_row.addWidget(name_label)
-            top_row.addStretch()
-
-            layout.addLayout(top_row)
+            layout.addWidget(name_label)
 
             # Режим отображения и параметры для G-code слоев
             if isinstance(self.layer, GCodeLayer):
@@ -246,7 +226,10 @@ class LayerWidget(QWidget):
         """(название, обработчик) -- сюда добавляются новые операции редактирования."""
         return [
             ("Обрезать / сохранить часть (ползунки)...", self.on_export_range),
-            ("Выделить полигоном и сохранить...", self.on_select_polygon),
+            ("Выделить полигоном...", self.on_select_polygon),
+            ("Выделить рамкой...", self.on_select_rect),
+            ("Копировать выделенные линии в новый слой...", lambda: self.window().extract_selected_lines(self.layer, cut=False)),
+            ("Вырезать выделенные линии в новый слой...", lambda: self.window().extract_selected_lines(self.layer, cut=True)),
         ]
 
     def _setup_edit_ui(self, parent_layout):
@@ -262,8 +245,39 @@ class LayerWidget(QWidget):
         run_btn.setToolTip("Запустить выбранное действие над этим слоем")
         run_btn.clicked.connect(self.on_run_edit_action)
         v.addWidget(run_btn)
+
+        # Как область (полигон/рамка) обращается с блоками штрихов; значения хранятся в QSettings
+        # (окно слоя создаётся до добавления в главное окно, поэтому читаем настройки напрямую)
+        settings = QSettings('SVG_GCode_Editor', 'LayerEditor')
+        self.block_cb = QCheckBox("Область не перерезает блоки штрихов")
+        self.block_cb.setToolTip(
+            "Блок штрихов (между подъёмами инструмента), которого касается граница области, "
+            "не режется, а целиком уходит внутрь или остаётся снаружи.\n"
+            "Работает в режимах «Линии» и «Линии и точки»; в режиме «Точки» режутся точки.")
+        self.block_cb.setChecked(settings.value('area/block_mode', False, type=bool))
+        v.addWidget(self.block_cb)
+        tol_row = QHBoxLayout()
+        tol_row.addWidget(QLabel("Допуск у границы, мм:"))
+        self.tol_spin = QDoubleSpinBox()
+        self.tol_spin.setRange(0.0, 1000.0)
+        self.tol_spin.setDecimals(2)
+        self.tol_spin.setValue(settings.value('area/tol_mm', 1.0, type=float))
+        self.tol_spin.setToolTip(
+            "Блок, выступающий за границу не больше допуска, остаётся внутри; заходящий внутрь "
+            "не глубже допуска — остаётся снаружи; иначе блок уходит туда, где его большая часть.")
+        self.tol_spin.setEnabled(self.block_cb.isChecked())
+        tol_row.addWidget(self.tol_spin)
+        v.addLayout(tol_row)
+        self.block_cb.toggled.connect(self._on_block_options)
+        self.tol_spin.valueChanged.connect(self._on_block_options)
         group.setLayout(v)
         parent_layout.addWidget(group)
+
+    def _on_block_options(self, *_):
+        self.tol_spin.setEnabled(self.block_cb.isChecked())
+        mw = self.window()
+        if hasattr(mw, 'set_area_options'):
+            mw.set_area_options(block_mode=self.block_cb.isChecked(), tol_mm=self.tol_spin.value())
 
     def on_run_edit_action(self):
         idx = self.edit_combo.currentIndex()
@@ -279,6 +293,16 @@ class LayerWidget(QWidget):
             self.window().start_polygon_selection(self.layer)
         except Exception as e:
             logger.error(f"Error starting polygon selection: {e}", exc_info=True)
+
+    def on_select_rect(self):
+        try:
+            item = getattr(self.layer, 'current_item', None)
+            if item is None or item.point_count() == 0:
+                logger.warning("No G-code loaded for this layer -- nothing to select")
+                return
+            self.window().start_rect_selection(self.layer)
+        except Exception as e:
+            logger.error(f"Error starting rect selection: {e}", exc_info=True)
 
     def on_visibility_changed(self, visible):
         self.layer.visible = visible
