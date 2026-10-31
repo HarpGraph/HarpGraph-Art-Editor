@@ -12,8 +12,12 @@ RIGHT_ICONS = 3   # ▲ ▼ ✕ справа
 
 class _LayerRowDelegate(QStyledItemDelegate):
     def sizeHint(self, option, index):
+        # ширина строки = ширина списка (а не длина текста): иначе при длинном пути
+        # к файлу кнопки справа уезжают за край и их не видно
         size = super().sizeHint(option, index)
-        return QSize(size.width() + (2 + RIGHT_ICONS) * ICON_W, max(size.height(), 26))
+        widget = option.widget
+        width = widget.viewport().width() if widget is not None else size.width()
+        return QSize(width, max(size.height(), 26))
 
     def paint(self, painter, option, index):
         opt = QStyleOptionViewItem(option)
@@ -39,13 +43,15 @@ class _LayerRowDelegate(QStyledItemDelegate):
         painter.setOpacity(1.0 if locked else 0.25)
         painter.drawText(lock_rect, Qt.AlignCenter, "\U0001F512" if locked else "\U0001F513")
 
-        # справа: ▲ ▼ ✕ (стрелка бледнеет, если слой уже крайний)
+        # справа: ▲ ▼ ✕ (стрелка бледнеет, если слой уже крайний); привязка к ширине списка
+        vp_w = widget.viewport().width() if widget is not None else rect.width()
+        right = rect.left() + vp_w - 1
         count = index.model().rowCount()
         row = index.row()
         for slot, (glyph, enabled) in enumerate((("▲", row > 0),
                                                  ("▼", row < count - 1),
                                                  ("✕", True))):
-            r = QRect(rect.right() + 1 - (RIGHT_ICONS - slot) * ICON_W, rect.top(), ICON_W, rect.height())
+            r = QRect(right + 1 - (RIGHT_ICONS - slot) * ICON_W, rect.top(), ICON_W, rect.height())
             painter.setOpacity(1.0 if enabled else 0.2)
             painter.drawText(r, Qt.AlignCenter, glyph)
 
@@ -53,7 +59,8 @@ class _LayerRowDelegate(QStyledItemDelegate):
         painter.setFont(option.font)
         selected = bool(opt.state & QStyle.State_Selected)
         painter.setPen(opt.palette.color(QPalette.HighlightedText if selected else QPalette.Text))
-        text_rect = rect.adjusted(2 * ICON_W + 4, 0, -(RIGHT_ICONS * ICON_W + 4), 0)
+        text_rect = QRect(rect.left() + 2 * ICON_W + 4, rect.top(),
+                          vp_w - (2 + RIGHT_ICONS) * ICON_W - 8, rect.height())
         painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft,
                          painter.fontMetrics().elidedText(text, Qt.ElideRight, text_rect.width()))
         painter.restore()
@@ -69,6 +76,10 @@ class LayerListWidget(QListWidget):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)   # длинные имена обрезаются с «…»
         self.setMouseTracking(True)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.scheduleDelayedItemsLayout()   # ширина строк = ширина списка
+
     def _toggle_target(self, pos):
         item = self.itemAt(pos)
         if item is None:
@@ -79,7 +90,7 @@ class LayerListWidget(QListWidget):
             return item, 'visible'
         if x < 2 * ICON_W:
             return item, 'locked'
-        from_right = rect.right() - pos.x()
+        from_right = self.viewport().width() - pos.x()
         if from_right < ICON_W:
             return item, 'delete'
         if from_right < 2 * ICON_W:
