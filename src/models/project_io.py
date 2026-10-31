@@ -206,4 +206,5 @@ def load_project(main_window, filename: str):
                 failed.append((name, file_path))
 
     main_window.update_layers_z_values()
+    main_window._sync_active_layer()
     return added, failed

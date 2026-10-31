@@ -163,6 +163,12 @@ class SvgLayer(BaseLayer):
             self.current_item.set_svg_data(scaled)
             self.current_item.setPos(pos)
 
+    def reset_position(self):
+        """Вернуть слой на исходное место: по центру рабочего поля (как при загрузке)."""
+        if self.current_item and self.svg_size_mm[0]:
+            w, h = self.svg_size_mm
+            self.current_item.setPos(-w / 2.0, -h / 2.0)
+
     def export_gcode(self, filename: str, feed: float = 1000.0, travel_z: float = 5.0,
                       draw_z: float = 0.0, optimize: bool = True, per_pen: bool = False) -> bool:
         if not self.current_item:

@@ -144,6 +144,11 @@ class LayerWidget(QWidget):
 
                 image_layout.addLayout(size_layout)
 
+                self.reset_pos_btn = QPushButton("Вернуть на место (в центр поля)")
+                self.reset_pos_btn.setToolTip("Вернуть слой в исходное положение -- центр картинки в центр рабочего поля")
+                self.reset_pos_btn.clicked.connect(self.on_reset_position)
+                image_layout.addWidget(self.reset_pos_btn)
+
                 opacity_layout = QHBoxLayout()
                 opacity_label = QLabel("Прозрачность:")
                 self.opacity_slider = QSlider(Qt.Horizontal)
@@ -179,6 +184,11 @@ class LayerWidget(QWidget):
                 self.height_spin.valueChanged.connect(self.on_image_size_changed)
                 size_layout.addWidget(self.height_spin)
                 svg_layout.addLayout(size_layout)
+
+                self.reset_pos_btn = QPushButton("Вернуть на место (в центр поля)")
+                self.reset_pos_btn.setToolTip("Вернуть слой в исходное положение -- центр листа в центр рабочего поля")
+                self.reset_pos_btn.clicked.connect(self.on_reset_position)
+                svg_layout.addWidget(self.reset_pos_btn)
 
                 color_layout = QHBoxLayout()
                 self.line_color_btn = QPushButton("Цвет линий")
@@ -545,6 +555,13 @@ class LayerWidget(QWidget):
             logger.debug(f"Layer {self.layer.name} grid lock changed to: {locked}")
         except Exception as e:
             logger.error(f"Error changing grid lock state: {e}", exc_info=True)
+
+    def on_reset_position(self):
+        try:
+            if hasattr(self.layer, 'reset_position'):
+                self.layer.reset_position()
+        except Exception as e:
+            logger.error(f"Error resetting layer position: {e}", exc_info=True)
 
     def on_image_size_changed(self):
         """Applies the width/height spinboxes -- shared by ImageLayer and SvgLayer."""

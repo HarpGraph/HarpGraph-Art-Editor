@@ -11,7 +11,6 @@ class ImageGraphicsItem(QGraphicsPixmapItem):
         self.height_mm = float(pixmap.height()) if pixmap.height() else 0.0
         self.setTransformationMode(Qt.SmoothTransformation)
         self.setFlag(self.ItemIsMovable)
-        self.setFlag(self.ItemIsSelectable)
 
     def set_size_mm(self, width_mm: float, height_mm: float):
         # Clamp to positive values

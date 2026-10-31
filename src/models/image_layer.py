@@ -23,7 +23,7 @@ class ImageLayer(BaseLayer):
                 logger.error(f"Failed to load image: {filename}")
                 return False
 
-            # Очистка предыдущего элемента
+            # пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
             if self.current_item:
                 self.scene.removeItem(self.current_item)
                 self.current_item = None
@@ -35,7 +35,7 @@ class ImageLayer(BaseLayer):
             item.setOpacity(self._opacity)
             item.set_locked(self._locked)
 
-            # Центрируем изображение относительно нулевой точки
+            # пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ
             item.setPos(-width_mm / 2.0, -height_mm / 2.0)
 
             self.scene.addItem(item)
@@ -53,6 +53,12 @@ class ImageLayer(BaseLayer):
         self.image_size_mm = (width_mm, height_mm)
         if self.current_item:
             self.current_item.set_size_mm(width_mm, height_mm)
+
+    def reset_position(self):
+        """Р’РµСЂРЅСѓС‚СЊ СЃР»РѕР№ РЅР° РёСЃС…РѕРґРЅРѕРµ РјРµСЃС‚Рѕ: РїРѕ С†РµРЅС‚СЂСѓ СЂР°Р±РѕС‡РµРіРѕ РїРѕР»СЏ (РєР°Рє РїСЂРё Р·Р°РіСЂСѓР·РєРµ)."""
+        if self.current_item and self.image_size_mm[0]:
+            w, h = self.image_size_mm
+            self.current_item.setPos(-w / 2.0, -h / 2.0)
 
     def set_locked(self, locked: bool):
         self.locked = locked

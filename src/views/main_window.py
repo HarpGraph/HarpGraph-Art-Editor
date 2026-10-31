@@ -657,6 +657,7 @@ class MainWindow(QMainWindow):
             # глазик/замок в списке слоёв перерисовываются при любом изменении слоя
             layer.visibility_changed.connect(lambda _v: self.layer_list.viewport().update())
             layer.locked_changed.connect(lambda _v: self.layer_list.viewport().update())
+            layer.locked_changed.connect(lambda _v: self._sync_active_layer())
             # Элемент G-code/SVG слоя появляется только после фоновой загрузки --
             # тогда же нужно выставить порядок слоёв (Z) и активный слой
             load_sig = getattr(layer, 'load_finished', None)
@@ -791,14 +792,23 @@ class MainWindow(QMainWindow):
 
     def _sync_active_layer(self, current=None):
         """Выбор/наведение точек работают только на активном (выбранном) слое:
-        у остальных выделение сбрасывается и пропадает с листа."""
+        у остальных выделение сбрасывается и пропадает с листа.
+        Мышь на листе слушает ТОЛЬКО активный незаблокированный слой: клики по остальным
+        проходят сквозь них -- выбранный в списке слой можно двигать, даже если он лежит
+        под другими, а порядок слоёв при этом не меняется."""
         if current is None:
             current = self.layer_list.currentItem()
         active_layer = current.data(Qt.UserRole) if current is not None else None
         for layer in self.layers:
             item = getattr(layer, 'current_item', None)
-            if item is not None and hasattr(item, 'set_active'):
+            if item is None:
+                continue
+            if hasattr(item, 'set_active'):
                 item.set_active(active_layer is None or layer is active_layer)
+            if layer.locked and hasattr(item, 'drop_selection'):
+                item.drop_selection()
+            listens = (active_layer is None or layer is active_layer) and not layer.locked
+            item.setAcceptedMouseButtons(Qt.AllButtons if listens else Qt.NoButton)
 
     def on_layer_selected(self, current, previous):
         """Обработчик выбора слоя в списке"""

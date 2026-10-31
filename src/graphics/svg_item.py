@@ -17,7 +17,6 @@ class SvgGraphicsItem(QGraphicsItemGroup):
         self.line_color = QColor(Qt.black)
         self.layer_ref = None
         self.setFlag(QGraphicsItem.ItemIsMovable)
-        self.setFlag(QGraphicsItem.ItemIsSelectable)
         self._bounding_rect = QRectF()
 
     def set_svg_data(self, subpaths):
@@ -42,6 +41,7 @@ class SvgGraphicsItem(QGraphicsItemGroup):
                 if self.path_item.scene():
                     self.path_item.scene().removeItem(self.path_item)
             self.path_item = QGraphicsPathItem(path, self)
+            self.path_item.setAcceptedMouseButtons(Qt.NoButton)   # клики обрабатывает сам слой
             pen = QPen(self.line_color, 0)
             pen.setCosmetic(True)
             self.path_item.setPen(pen)

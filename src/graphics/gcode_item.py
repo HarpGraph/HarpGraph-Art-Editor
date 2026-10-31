@@ -200,7 +200,6 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
         self.show_travel = True
         self.layer_ref = None
         self.setFlag(QGraphicsItem.ItemIsMovable)
-        self.setFlag(QGraphicsItem.ItemIsSelectable)
         self.setFlag(QGraphicsItem.ItemUsesExtendedStyleOption)  # exposedRect in paint()
         self.setAcceptHoverEvents(True)
         self.initial_pos = None
@@ -539,8 +538,8 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
     def contextMenuEvent(self, event):
         """Правая кнопка на точке -- меню «Копировать координаты»."""
         try:
-            if not self._active:
-                event.ignore()   # неактивный слой не перехватывает меню нижних слоёв
+            if not self._active or getattr(self.layer_ref, '_locked', False):
+                event.ignore()   # неактивный/заблокированный слой не перехватывает меню нижних слоёв
                 return
             mw = self._get_main_window()
             if mw is not None and (getattr(mw, 'selection_mode', False)
@@ -919,6 +918,13 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
             self.clear_segment_selection()
         self.update()
 
+    def drop_selection(self):
+        """Слой заблокирован: выбранные точки и линии снимаются, новые не выбираются."""
+        self._hovered_idx = None
+        self._selected_idx = None
+        self.clear_segment_selection()
+        self.update()
+
     def set_grid_lock(self, locked: bool):
         try:
             if locked:
@@ -940,6 +946,9 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
     # ------------------------------------------------------------------
 
     def mousePressEvent(self, event):
+        if getattr(self.layer_ref, '_locked', False):
+            event.ignore()   # заблокированный слой не выбирается и не двигается -- клик уходит на панорамирование
+            return
         if event.button() == Qt.LeftButton:
             # левый клик: точка (кольцо) -- если попали в неё, иначе линия (штрих);
             # Shift -- линии подряд, Ctrl -- выборочно; клик мимо снимает выбор
