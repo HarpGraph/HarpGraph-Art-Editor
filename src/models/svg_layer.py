@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import QGraphicsScene, QGraphicsItem
 import logging
 from .base_layer import BaseLayer
 from .layer_types import LayerType
-from .svg_utils import parse_svg_subpaths
+from .svg_utils import parse_svg_subpaths, parse_svg_pens
 from .gcode_pathops import subpaths_to_gcode_lines
 from src.graphics.svg_item import SvgGraphicsItem
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class _SvgParseSignals(QObject):
-    finished = pyqtSignal(list, object)  # subpaths, bbox
+    finished = pyqtSignal(list, object, object)  # subpaths, bbox, fast_info|None
     error    = pyqtSignal(str)
 
 
@@ -27,8 +27,14 @@ class _SvgParseWorker(QRunnable):
 
     def run(self):
         try:
+            # fast numpy path for simple line-only SVGs (Orchestrator export):
+            # millimetres + per-pen colour/width, ~30x faster than svgelements
+            fast = parse_svg_pens(self.filename)
+            if fast is not None:
+                self.signals.finished.emit(fast['subpaths'], fast['bbox'], fast)
+                return
             subpaths, bbox = parse_svg_subpaths(self.filename)
-            self.signals.finished.emit(subpaths, bbox)
+            self.signals.finished.emit(subpaths, bbox, None)
         except Exception as exc:
             self.signals.error.emit(str(exc))
 
@@ -43,6 +49,8 @@ class SvgLayer(BaseLayer):
         self.file_path     = None
         self.line_color    = QColor(Qt.black)
         self.svg_size_mm   = (None, None)
+        self.pens          = []    # [{'color': '#RRGGBB', 'width_mm': float}] (fast parse only)
+        self._subpath_pens = []    # pen number per raw subpath (same order)
         self._raw_subpaths = []   # unscaled, origin-relative (native SVG units)
         self._load_generation = 0
         self._workers       = []    # keeps in-flight workers alive (avoids GC crash)
@@ -61,7 +69,7 @@ class SvgLayer(BaseLayer):
             worker = _SvgParseWorker(filename)
             self._workers.append(worker)
             worker.signals.finished.connect(
-                lambda sps, bbox, g=generation, w=worker: self._on_parse_finished(sps, bbox, g, w))
+                lambda sps, bbox, fast, g=generation, w=worker: self._on_parse_finished(sps, bbox, fast, g, w))
             worker.signals.error.connect(
                 lambda msg, g=generation, w=worker: self._on_parse_error(msg, g, w))
             QThreadPool.globalInstance().start(worker)
@@ -70,7 +78,7 @@ class SvgLayer(BaseLayer):
             logger.error(f'Error starting SVG load: {e}', exc_info=True)
             return False
 
-    def _on_parse_finished(self, subpaths, bbox, generation, worker=None):
+    def _on_parse_finished(self, subpaths, bbox, fast_info, generation, worker=None):
         if worker in self._workers:
             self._workers.remove(worker)
         if generation != self._load_generation:
@@ -79,6 +87,10 @@ class SvgLayer(BaseLayer):
             logger.warning('No drawable shapes found in SVG file')
             self.load_finished.emit(False)
             return
+
+        # per-pen info is only available from the fast Orchestrator-format parse
+        self.pens          = list(fast_info['pens']) if fast_info else []
+        self._subpath_pens = list(fast_info['pen_index']) if fast_info else []
 
         min_x, min_y, max_x, max_y = bbox
         self._raw_subpaths = [[(x - min_x, y - min_y) for x, y in sp] for sp in subpaths]
@@ -137,11 +149,30 @@ class SvgLayer(BaseLayer):
             self.current_item.setPos(pos)
 
     def export_gcode(self, filename: str, feed: float = 1000.0, travel_z: float = 5.0,
-                      draw_z: float = 0.0, optimize: bool = True) -> bool:
+                      draw_z: float = 0.0, optimize: bool = True, per_pen: bool = False) -> bool:
         if not self.current_item:
             return False
         try:
             subpaths = self.current_item.subpaths_in_scene()
+            if per_pen and len(self.pens) >= 2 and len(self._subpath_pens) == len(subpaths):
+                # one self-contained file per pen (= pencil), suffix _penN
+                import os
+                base, ext = os.path.splitext(filename)
+                ext = ext or '.gcode'
+                written = []
+                for i in range(len(self.pens)):
+                    pen_subpaths = [sp for sp, p in zip(subpaths, self._subpath_pens) if p == i]
+                    if not pen_subpaths:
+                        continue
+                    lines = subpaths_to_gcode_lines(pen_subpaths, feed=feed, travel_z=travel_z,
+                                                     draw_z=draw_z, optimize=optimize)
+                    pen_file = f'{base}_pen{i + 1}{ext}'
+                    with open(pen_file, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(lines) + '\n')
+                    written.append(pen_file)
+                logger.info(f'Exported {len(written)} per-pen G-code files: {written}')
+                return bool(written)
+
             lines = subpaths_to_gcode_lines(subpaths, feed=feed, travel_z=travel_z,
                                              draw_z=draw_z, optimize=optimize)
             with open(filename, 'w', encoding='utf-8') as f:

@@ -15,6 +15,11 @@ def optimize_subpath_order(subpaths, start=(0.0, 0.0)):
     remaining subpath's start OR end is closest (reversing it if the end
     is closer), then continue from there. Not globally optimal (TSP is
     NP-hard) but cuts travel distance drastically versus file order."""
+    if len(subpaths) > 200:
+        # the plain-Python loop below is O(n^2) with Python-level math --
+        # unusable for tens of thousands of stroke blocks (hours); same
+        # greedy algorithm vectorised with numpy finishes in seconds
+        return _optimize_subpath_order_numpy(subpaths, start)
     remaining = list(range(len(subpaths)))
     ordered = []
     cur = start
@@ -34,6 +39,36 @@ def optimize_subpath_order(subpaths, start=(0.0, 0.0)):
         ordered.append(sp)
         cur = sp[-1]
         remaining.remove(best_idx)
+    return ordered
+
+
+def _optimize_subpath_order_numpy(subpaths, start=(0.0, 0.0)):
+    """Same greedy nearest-neighbour as above, but distances to ALL remaining
+    subpath starts/ends are computed per step as numpy array operations."""
+    import numpy as np
+    n = len(subpaths)
+    starts = np.array([sp[0] for sp in subpaths], dtype=np.float64)
+    ends   = np.array([sp[-1] for sp in subpaths], dtype=np.float64)
+    used   = np.zeros(n, dtype=bool)
+    cur    = np.asarray(start, dtype=np.float64)
+
+    ordered = []
+    for _ in range(n):
+        # squared distances rank identically to true distances
+        d_fwd = ((starts - cur) ** 2).sum(axis=1)
+        d_rev = ((ends   - cur) ** 2).sum(axis=1)
+        d_fwd[used] = np.inf
+        d_rev[used] = np.inf
+        i_f = int(d_fwd.argmin())
+        i_r = int(d_rev.argmin())
+        if d_fwd[i_f] <= d_rev[i_r]:
+            idx, rev = i_f, False
+        else:
+            idx, rev = i_r, True
+        used[idx] = True
+        sp = subpaths[idx]
+        ordered.append(list(reversed(sp)) if rev else sp)
+        cur = starts[idx] if rev else ends[idx]
     return ordered
 
 

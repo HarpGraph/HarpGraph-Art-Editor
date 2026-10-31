@@ -973,14 +973,26 @@ class MainWindow(QMainWindow):
                 filename, _ = QFileDialog.getOpenFileName(self, "Загрузить SVG", "", "SVG files (*.svg);;All files (*.*)")
                 if not filename:
                     return
+                native_size, size_is_mm = (100.0, 100.0), False
                 try:
-                    from ..models.svg_utils import get_svg_bbox
-                    bbox = get_svg_bbox(filename)
+                    from ..models.svg_utils import get_svg_bbox, parse_svg_pens, sniff_svg_mm_size, PX_TO_MM
+                    fast = parse_svg_pens(filename)
+                    if fast:
+                        # Orchestrator-format SVG: strokes bbox already in mm
+                        bx0, by0, bx1, by1 = fast['bbox']
+                        native_size, size_is_mm = (bx1 - bx0, by1 - by0), True
+                    else:
+                        bbox = get_svg_bbox(filename)
+                        if bbox:
+                            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                            if sniff_svg_mm_size(filename):
+                                # document declares mm: svgelements parses at 96 dpi px
+                                native_size, size_is_mm = (w * PX_TO_MM, h * PX_TO_MM), True
+                            else:
+                                native_size = (w, h)
                 except Exception as e:
                     logger.error(f"Error reading SVG bbox: {e}", exc_info=True)
-                    bbox = None
-                native_size = (bbox[2] - bbox[0], bbox[3] - bbox[1]) if bbox else (100.0, 100.0)
-                size_dialog = SvgSizeDialog(self, native_size=native_size)
+                size_dialog = SvgSizeDialog(self, native_size=native_size, size_is_mm=size_is_mm)
                 if size_dialog.exec_() != SvgSizeDialog.Accepted:
                     return
                 size = size_dialog.get_size()

@@ -511,7 +511,7 @@ class LayerWidget(QWidget):
     def on_export_gcode(self):
         """Convert the SVG layer's flattened paths into a G-code file."""
         try:
-            dialog = SvgExportDialog(self)
+            dialog = SvgExportDialog(self, pens=getattr(self.layer, 'pens', []))
             if dialog.exec_() != SvgExportDialog.Accepted:
                 return
             opts = dialog.get_options()
@@ -520,7 +520,8 @@ class LayerWidget(QWidget):
             if not filename:
                 return
             ok = self.layer.export_gcode(filename, feed=opts['feed'], travel_z=opts['travel_z'],
-                                          draw_z=opts['draw_z'], optimize=opts['optimize'])
+                                          draw_z=opts['draw_z'], optimize=opts['optimize'],
+                                          per_pen=opts['per_pen'])
             if not ok:
                 logger.error("Failed to export G-code from SVG layer")
         except Exception as e:
