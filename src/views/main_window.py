@@ -8,7 +8,6 @@ from PyQt5.QtWidgets import (QMainWindow, QDockWidget, QListWidget,
                            QGraphicsEllipseItem, QFrame, QMenu)
 from PyQt5.QtCore import Qt, QSettings, QPointF, QRectF, QEvent  # Добавляем QSettings
 from PyQt5.QtGui import QPainter, QColor, QPolygonF, QPen, QBrush, QPainterPath, QCursor
-from src.views.layer_dialog import NewLayerDialog
 from src.views.image_size_dialog import ImageSizeDialog
 from src.views.svg_size_dialog import SvgSizeDialog
 from src.models.layer_types import LayerType
@@ -52,6 +51,7 @@ class MainWindow(QMainWindow):
         super().__init__() 
         self.setWindowTitle("Layer Editor")
         self.layers = []  # Список всех слоев
+        self._layer_counter = 0   # для автоимён «Слой N»
         self.settings = QSettings('SVG_GCode_Editor', 'LayerEditor')
         # фиксированное "рабочее поле" (мм) -- стабильный ориентир для навигации,
         # как в Gcode_Terminal -- задаётся до setup_ui(), т.к. тулбар читает эти значения
@@ -153,7 +153,23 @@ class MainWindow(QMainWindow):
         item.setText(text)
 
     def delete_selected_layers(self):
-        selected_items = self.layer_list.selectedItems()
+        self._delete_layer_items(self.layer_list.selectedItems())
+
+    def _delete_layer_row(self, row: int):
+        """Крестик в строке списка: удаляет именно эту строку (с подтверждением --
+        отмены удаления нет)."""
+        item = self.layer_list.item(row)
+        if item is None:
+            return
+        layer = item.data(Qt.UserRole)
+        name = f"{layer.name}" if layer else "?"
+        reply = QMessageBox.question(
+            self, "Удалить слой", f"Удалить слой «{name}»?\n(файлы на диске не удаляются)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self._delete_layer_items([item])
+
+    def _delete_layer_items(self, selected_items):
         if not selected_items:
             return
 
@@ -195,6 +211,7 @@ class MainWindow(QMainWindow):
                 self.scene.removeItem(current_item)
         self.layers.clear()
         self.layer_list.clear()
+        self._layer_counter = 0
         self.on_layer_selected(None, None)
         self._update_scene_bounds()
 
@@ -244,6 +261,14 @@ class MainWindow(QMainWindow):
             missing = "\n".join(f"- {name}: {path}" for name, path in failed)
             msg += f"\n\nНе найдены файлы для {len(failed)} слоёв:\n{missing}"
         QMessageBox.information(self, "Проект", msg)
+
+    def _move_layer_row(self, row: int, direction: int):
+        """Стрелки в строке списка: двигают именно эту строку."""
+        item = self.layer_list.item(row)
+        if item is None:
+            return
+        self.layer_list.setCurrentItem(item)
+        self.move_layer(direction)
 
     def move_layer(self, direction: int):
         current_item = self.get_current_layer_item()
@@ -350,18 +375,15 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
         menubar = self.menuBar()
         file_menu = menubar.addMenu("Файл")
-        layer_menu = menubar.addMenu("Слой")
         view_menu = menubar.addMenu("Вид")
         field_menu = menubar.addMenu("Рабочее поле")
         grid_menu = menubar.addMenu("Сетка")
 
         # --- Файл ---
-        new_layer_action = QAction("Новый слой", self)
-        new_layer_action.triggered.connect(self.create_new_layer)
-        file_menu.addAction(new_layer_action)
-        toolbar.addAction(new_layer_action)
-
+        # Тип слоя выбирается автоматически по расширению файла;
+        # удаление и перемещение слоёв -- кнопками в строке списка слоёв.
         load_file_action = QAction("Загрузить файл", self)
+        load_file_action.setToolTip("G-code, SVG или картинка -- слой нужного типа создаётся сам")
         load_file_action.triggered.connect(self.load_file_to_layer)
         file_menu.addAction(load_file_action)
         toolbar.addAction(load_file_action)
@@ -377,19 +399,6 @@ class MainWindow(QMainWindow):
         open_project_action.setToolTip("Восстановить все слои из сохранённого проекта")
         open_project_action.triggered.connect(self.open_project_dialog)
         file_menu.addAction(open_project_action)
-
-        # --- Слой ---
-        delete_layer_action = QAction("Удалить слой", self)
-        delete_layer_action.triggered.connect(self.delete_selected_layers)
-        layer_menu.addAction(delete_layer_action)
-
-        move_up_action = QAction("Поднять слой вверх", self)
-        move_up_action.triggered.connect(lambda: self.move_layer(-1))
-        layer_menu.addAction(move_up_action)
-
-        move_down_action = QAction("Опустить слой вниз", self)
-        move_down_action.triggered.connect(lambda: self.move_layer(1))
-        layer_menu.addAction(move_down_action)
 
         toolbar.addSeparator()
 
@@ -621,11 +630,10 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error in grid settings: {e}")
 
-    def create_new_layer(self):
-        dialog = NewLayerDialog(self)
-        if dialog.exec_() == NewLayerDialog.Accepted:
-            layer_info = dialog.get_layer_info()
-            self.add_layer(layer_info['name'], layer_info['type'])
+    def _next_layer_name(self) -> str:
+        """Порядковый номер вместо имени: «Слой 1», «Слой 2»... (номера не переиспользуются)."""
+        self._layer_counter += 1
+        return f"Слой {self._layer_counter}"
 
     def add_layer(self, name: str, layer_type: LayerType):
         """Создание и добавление нового слоя"""
@@ -755,16 +763,8 @@ class MainWindow(QMainWindow):
         self.layer_list.setSelectionMode(QListWidget.ExtendedSelection)
         main_layout.addWidget(self.layer_list)
 
-        buttons_row = QHBoxLayout()
-        for text, tip, slot in (
-                ("▲", "Слой выше", lambda: self.move_layer(-1)),
-                ("▼", "Слой ниже", lambda: self.move_layer(1)),
-                ("Удалить слой", "Удалить выбранные слои", self.delete_selected_layers)):
-            btn = QPushButton(text)
-            btn.setToolTip(tip)
-            btn.clicked.connect(slot)
-            buttons_row.addWidget(btn)
-        main_layout.addLayout(buttons_row)
+        self.layer_list.moveRequested.connect(self._move_layer_row)
+        self.layer_list.deleteRequested.connect(self._delete_layer_row)
         
         # Создаем контейнер для виджета слоя
         # Панель слоя может быть выше окна -- даём прокрутку, чтобы все настройки были достижимы
@@ -950,29 +950,53 @@ class MainWindow(QMainWindow):
             return True
         return False
 
-    def load_file_to_layer(self):
-        try:
-            layer = self.get_current_layer()
-            if not layer:
+    # тип слоя определяется по расширению загружаемого файла
+    GCODE_EXTS = ('.gcode', '.nc', '.ngc', '.gc', '.tap', '.cnc')
+    SVG_EXTS = ('.svg',)
+    IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp')
+
+    @classmethod
+    def _layer_type_for_file(cls, filename: str):
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in cls.GCODE_EXTS:
+            return LayerType.GCODE
+        if ext in cls.SVG_EXTS:
+            return LayerType.SVG
+        if ext in cls.IMAGE_EXTS:
+            return LayerType.IMAGE
+        return None
+
+    def _remove_layer(self, layer):
+        """Убрать слой, который не удалось загрузить (без вопросов)."""
+        for r in range(self.layer_list.count()):
+            item = self.layer_list.item(r)
+            if item.data(Qt.UserRole) is layer:
+                self._delete_layer_items([item])
                 return
 
-            if layer.type == LayerType.GCODE:
-                filename, _ = QFileDialog.getOpenFileName(self, "Загрузить G-code", "", "G-code files (*.gcode);;All files (*.*)")
-                if not filename:
-                    return
-                # OPT-3: load_file() returns immediately; _on_async_load_finished
-                # is called in the GUI thread via load_finished signal when done.
-                # UniqueConnection prevents double-connect on repeated loads.
-                layer.load_finished.connect(
-                    lambda ok, _l=layer: self._on_async_load_finished(ok, _l),
-                    Qt.UniqueConnection
-                )
-                layer.load_file(filename)
+    def load_file_to_layer(self):
+        """«Загрузить файл»: слой нужного типа («Слой N») создаётся сам по расширению файла."""
+        try:
+            all_exts = self.GCODE_EXTS + self.SVG_EXTS + self.IMAGE_EXTS
+            patterns = lambda exts: " ".join(f"*{e}" for e in exts)
+            file_filter = (f"Все поддерживаемые ({patterns(all_exts)});;"
+                           f"G-code ({patterns(self.GCODE_EXTS)});;"
+                           f"SVG ({patterns(self.SVG_EXTS)});;"
+                           f"Изображения ({patterns(self.IMAGE_EXTS)});;"
+                           "Все файлы (*.*)")
+            filename, _ = QFileDialog.getOpenFileName(self, "Загрузить файл", "", file_filter)
+            if not filename:
+                return
+            layer_type = self._layer_type_for_file(filename)
+            if layer_type is None:
+                QMessageBox.warning(
+                    self, "Загрузить файл",
+                    "Не знаю такой тип файла.\nПоддерживаются: G-code (.gcode .nc ...), SVG, картинки (.png .jpg .bmp).")
+                return
 
-            elif layer.type == LayerType.SVG:
-                filename, _ = QFileDialog.getOpenFileName(self, "Загрузить SVG", "", "SVG files (*.svg);;All files (*.*)")
-                if not filename:
-                    return
+            # размер спрашиваем ДО создания слоя -- «Отмена» не оставляет пустой слой
+            size = None
+            if layer_type == LayerType.SVG:
                 native_size, size_is_mm = (100.0, 100.0), False
                 try:
                     from ..models.svg_utils import get_svg_bbox, parse_svg_pens, sniff_svg_mm_size, PX_TO_MM
@@ -996,25 +1020,39 @@ class MainWindow(QMainWindow):
                 if size_dialog.exec_() != SvgSizeDialog.Accepted:
                     return
                 size = size_dialog.get_size()
-                layer.load_finished.connect(
-                    lambda ok, _l=layer: self._on_async_load_finished(ok, _l),
-                    Qt.UniqueConnection
-                )
-                layer.load_file(filename, size['width_mm'], size['height_mm'])
-
-            elif layer.type == LayerType.IMAGE:
-                filename, _ = QFileDialog.getOpenFileName(self, "Загрузить изображение", "", "Images (*.png *.jpg *.jpeg *.bmp);;All files (*.*)")
-                if not filename:
-                    return
+            elif layer_type == LayerType.IMAGE:
                 size_dialog = ImageSizeDialog(self, filename)
                 if size_dialog.exec_() != ImageSizeDialog.Accepted:
                     return
                 size = size_dialog.get_size()
-                success = layer.load_file(filename, size['width_mm'], size['height_mm'])
-                if success:
+
+            layer = self.add_layer(self._next_layer_name(), layer_type)
+            if layer is None:
+                return
+            # новый слой сразу становится выбранным -- его панель видна справа
+            new_item = self.layer_list.item(self.layer_list.count() - 1)
+            self.layer_list.clearSelection()
+            self.layer_list.setCurrentItem(new_item)
+            new_item.setSelected(True)
+
+            if layer_type == LayerType.IMAGE:
+                if layer.load_file(filename, size['width_mm'], size['height_mm']):
                     self._fit_view_to_scene(layer)
                 else:
                     logger.error(f"Ошибка загрузки файла {filename}")
+                    self._remove_layer(layer)
+                return
+
+            # load_file() returns immediately; _on_async_load_finished is called in
+            # the GUI thread via load_finished signal when the background parse is done.
+            layer.load_finished.connect(
+                lambda ok, _l=layer: self._on_async_load_finished(ok, _l),
+                Qt.UniqueConnection
+            )
+            if layer_type == LayerType.SVG:
+                layer.load_file(filename, size['width_mm'], size['height_mm'])
+            else:
+                layer.load_file(filename)
 
         except Exception as e:
             logger.error(f"Error loading file: {e}", exc_info=True)
@@ -1026,6 +1064,11 @@ class MainWindow(QMainWindow):
                 self._fit_view_to_scene(layer)
             else:
                 logger.error("Ошибка загрузки файла")
+                if layer in self.layers:
+                    # слой создан только ради этого файла -- пустой не оставляем
+                    self._remove_layer(layer)
+                    QMessageBox.warning(self, "Загрузить файл",
+                                        "Не удалось загрузить файл (подробности в app_log.txt).")
         except Exception as e:
             logger.error(f"Error in _on_async_load_finished: {e}", exc_info=True)
 
