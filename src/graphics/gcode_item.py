@@ -567,12 +567,13 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
                 copy_xy = menu.addAction(f'Копировать координаты  ({coords})')
                 copy_cmd = menu.addAction(f'Копировать как G-code  ({self._command_for_index(i)})')
             n_sel = self.selected_segment_count()
-            act_copy = act_cut = act_inv = act_clear = None
+            act_copy = act_cut = act_del = act_inv = act_clear = None
             if n_sel:
                 if i is not None:
                     menu.addSeparator()
                 act_copy = menu.addAction(f'Копировать выделенное ({n_sel} линий) в новый слой и файл…')
                 act_cut = menu.addAction(f'Вырезать выделенное ({n_sel} линий) в новый слой и файл…')
+                act_del = menu.addAction(f'Удалить выделенное ({n_sel} линий) — оставить холостой ход')
                 menu.addSeparator()
                 act_inv = menu.addAction('Инвертировать выделение')
                 act_clear = menu.addAction('Снять выделение')
@@ -587,6 +588,8 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
                 mw.extract_selected_lines(self.layer_ref, cut=False)
             elif chosen is act_cut and mw is not None:
                 mw.extract_selected_lines(self.layer_ref, cut=True)
+            elif chosen is act_del and mw is not None:
+                mw.delete_selected_lines(self.layer_ref)
             elif chosen is act_inv:
                 self.invert_segment_selection()
                 self._announce_selection()
@@ -723,7 +726,7 @@ class GCodeGraphicsItem(QGraphicsItemGroup):
         n = self.selected_segment_count()
         if mw is not None:
             mw.statusBar().showMessage(
-                f'Выделено линий: {n}. Правая кнопка — копировать или вырезать в новый слой.' if n
+                f'Выделено линий: {n}. Delete — убрать (холостой ход); правая кнопка — копировать, вырезать или убрать.' if n
                 else 'Выделение снято')
 
     def mouseDoubleClickEvent(self, event):

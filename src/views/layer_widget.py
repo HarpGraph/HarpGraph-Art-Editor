@@ -1,5 +1,5 @@
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QCheckBox, QGroupBox, QRadioButton,
-                             QPushButton, QColorDialog, QDoubleSpinBox, QFileDialog, QComboBox)
+                             QPushButton, QColorDialog, QDoubleSpinBox, QFileDialog, QComboBox, QMessageBox)
 from PyQt5.QtCore import Qt, QSettings
 import logging
 from ..models.base_layer import BaseLayer
@@ -245,6 +245,14 @@ class LayerWidget(QWidget):
     def _setup_edit_ui(self, parent_layout):
         group = QGroupBox("Редактирование G-code")
         v = QVBoxLayout()
+        del_btn = QPushButton("Удалить выделенные линии (холостой ход)")
+        del_btn.setToolTip("Выделенные линии перестанут рисоваться, перо пройдёт по ним поднятым (клавиша Delete)")
+        del_btn.clicked.connect(lambda: self.window().delete_selected_lines(self.layer))
+        v.addWidget(del_btn)
+        opt_btn = QPushButton("Оптимизировать холостые ходы")
+        opt_btn.setToolTip("Переставить штрихи так, чтобы перо меньше ходило поднятым (отмена — Ctrl+Z)")
+        opt_btn.clicked.connect(lambda: self.window().optimize_travel_moves(self.layer))
+        v.addWidget(opt_btn)
         self.edit_combo = QComboBox()
         self._edit_handlers = []
         for title, handler in self._gcode_edit_actions():
@@ -511,6 +519,11 @@ class LayerWidget(QWidget):
         try:
             if not self.layer.current_item or self.layer.current_item.point_count() == 0:
                 logger.warning("No G-code loaded for this layer -- nothing to trim")
+                return
+            if getattr(self.layer, 'dirty', False):
+                QMessageBox.information(
+                    self, "Обрезка",
+                    "Слой изменён и ещё не сохранён в файл. Сначала: Файл → Сохранить G-code слоя как...")
                 return
             dialog = GcodeTrimDialog(self, self.layer)
             dialog.show()

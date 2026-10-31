@@ -1,5 +1,6 @@
 from src.models.base_layer import BaseLayer
 from src.models.layer_types import LayerType
+from src.models.gcode_pathops import optimize_travel, write_gcode_layer
 from src.graphics.gcode_item import GCodeGraphicsItem
 from PyQt5.QtWidgets import QGraphicsScene, QGraphicsItem
 from PyQt5.QtCore import Qt, QObject, QRunnable, pyqtSignal, QThreadPool
@@ -220,6 +221,8 @@ class GCodeLayer(BaseLayer):
         self.show_travel    = True
         self.scale_x        = 1.0    # масштаб/искажение относительно рабочего поля
         self.scale_y        = 1.0
+        self.dirty          = False  # слой изменён правкой и ещё не сохранён в файл
+        self._undo_stack    = []     # прежние состояния для отмены правок
         self._load_generation = 0   # fixes double-load race (stale results ignored)
         self._workers       = []    # keeps in-flight workers alive (avoids GC crash)
 
@@ -371,3 +374,98 @@ class GCodeLayer(BaseLayer):
             return
         logger.error(f'Parse error: {error_msg}')
         self.load_finished.emit(False)
+
+    # ------------------------------------------------------------------
+    # Правка слоя «на месте» (удаление линий, оптимизация) с отменой, и сохранение
+    # ------------------------------------------------------------------
+
+    UNDO_LIMIT = 8
+
+    def _display_to_file(self, pts_display):
+        return np.column_stack((pts_display[:, 0], -pts_display[:, 1]))
+
+    def apply_edit(self, pts_display, is_travel):
+        """Заменить содержимое слоя новыми вершинами (экранные координаты, Y вниз).
+        Прежнее состояние запоминается для отмены; слой помечается как изменённый."""
+        item = self.current_item
+        if item is None:
+            return False
+        self._undo_stack.append((item.pts, item.is_travel, item.linenos, self.dirty))
+        del self._undo_stack[:-self.UNDO_LIMIT]
+        n = len(pts_display)
+        item.set_gcode_data(self._display_to_file(pts_display), is_travel,
+                            np.arange(1, n + 1, dtype=np.int32))
+        self.dirty = True
+        return True
+
+    def can_undo(self) -> bool:
+        return bool(self._undo_stack) and self.current_item is not None
+
+    def undo_edit(self):
+        if not self.can_undo():
+            return False
+        pts, trav, lns, dirty = self._undo_stack.pop()
+        self.current_item.set_gcode_data(self._display_to_file(pts), trav, lns)
+        self.dirty = dirty
+        return True
+
+    def delete_lines_to_travel(self, line_mask):
+        """Выделенные линии перестают рисоваться: соединение между точками остаётся
+        холостым ходом (перо поднято). Возвращает число превращённых линий."""
+        item = self.current_item
+        idx = np.flatnonzero(line_mask)
+        if item is None or not len(idx):
+            return 0
+        trav = np.asarray(item.is_travel, dtype=bool).copy()
+        changed = int((~trav[idx + 1]).sum())
+        trav[idx + 1] = True
+        self.apply_edit(item.pts.copy(), trav)
+        return changed
+
+    def optimize_travel_moves(self):
+        """Переставить штрихи так, чтобы холостых ходов было меньше.
+        Возвращает (было_мм, стало_мм) или None, если оптимизировать нечего."""
+        item = self.current_item
+        if item is None:
+            return None
+        res = optimize_travel(item.pts, item.is_travel)
+        if res is None:
+            return None
+        new_pts, new_trav, before, after = res
+        self.apply_edit(new_pts, new_trav)
+        return before, after
+
+    def save_edited(self, filename, travel_z=5.0, draw_z=0.0, feed=1000.0,
+                    with_z=True, apply_placement=True):
+        """«Специальное сохранение»: записать слой в G-code.
+        apply_placement -- учесть положение/масштаб слоя на поле (координаты станка: центр
+        поля = 0,0, Y вверх), после чего слой «запекается»: сдвиг и масштаб обнуляются,
+        вид на листе не меняется. Слой привязывается к новому файлу и перестаёт быть «изменённым»."""
+        item = self.current_item
+        if item is None or item.point_count() == 0:
+            return False
+        pts = item.pts.astype(np.float64)
+        baked = None
+        if apply_placement:
+            t = item.sceneTransform()
+            x = t.m11() * pts[:, 0] + t.m21() * pts[:, 1] + t.dx()
+            y = t.m12() * pts[:, 0] + t.m22() * pts[:, 1] + t.dy()
+            baked = np.column_stack((x, y))
+            pts = baked
+        file_pts = self._display_to_file(pts)
+        linenos = write_gcode_layer(filename, file_pts, item.is_travel, travel_z=travel_z,
+                                    draw_z=draw_z, feed=feed, with_z=with_z)
+        self.file_path = filename
+        self.dirty = False
+        if with_z:
+            self.travel_z = float(travel_z)   # так файл читается обратно: Z >= порога -- холостой ход
+        if baked is not None:
+            from PyQt5.QtGui import QTransform
+            item.set_gcode_data(file_pts, item.is_travel.copy(), linenos)
+            item.setPos(0, 0)
+            item.setTransform(QTransform())
+            self.scale_x = self.scale_y = 1.0
+            self._undo_stack.clear()   # прежние состояния были в старой системе координат
+        else:
+            item.linenos = linenos
+        return True

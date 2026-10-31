@@ -147,6 +147,8 @@ class MainWindow(QMainWindow):
 
     def update_layer_item_text(self, item: QListWidgetItem, layer: BaseLayer):
         text = f"{layer.name} ({layer.type})"
+        if getattr(layer, 'dirty', False):
+            text += " [изменён]"
         file_path = getattr(layer, 'file_path', None)
         if file_path:
             text += f" - {file_path}"
@@ -217,6 +219,16 @@ class MainWindow(QMainWindow):
 
     def save_project_dialog(self):
         """Save every layer (files, colours, position, opacity...) as one project file."""
+        dirty = [l.name for l in self.layers if getattr(l, 'dirty', False)]
+        if dirty:
+            reply = QMessageBox.question(
+                self, "Сохранить проект",
+                "Эти слои изменены, но не сохранены в файл — проект запомнит только исходные файлы, "
+                "правки в них пропадут:\n\n" + "\n".join(f"• {n}" for n in dirty) +
+                "\n\nСначала сохраните их: Файл → Сохранить G-code слоя как...\n\nСохранить проект всё равно?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
         filename, _ = QFileDialog.getSaveFileName(
             self, "Сохранить проект", "", "HarpGraph project (*.hgproj);;All files (*.*)")
         if not filename:
@@ -375,6 +387,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
         menubar = self.menuBar()
         file_menu = menubar.addMenu("Файл")
+        edit_menu = menubar.addMenu("Правка")
         view_menu = menubar.addMenu("Вид")
         field_menu = menubar.addMenu("Рабочее поле")
         grid_menu = menubar.addMenu("Сетка")
@@ -390,6 +403,14 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        save_gcode_action = QAction("Сохранить G-code слоя как...", self)
+        save_gcode_action.setToolTip("Сохранить отредактированный G-code выбранного слоя: с учётом положения на поле, с командами Z")
+        save_gcode_action.triggered.connect(self.save_gcode_layer_as)
+        file_menu.addAction(save_gcode_action)
+        toolbar.addAction(save_gcode_action)
+
+        file_menu.addSeparator()
+
         save_project_action = QAction("Сохранить проект...", self)
         save_project_action.setToolTip("Сохранить все слои с файлами/цветами/позицией в один файл-пресет")
         save_project_action.triggered.connect(self.save_project_dialog)
@@ -399,6 +420,24 @@ class MainWindow(QMainWindow):
         open_project_action.setToolTip("Восстановить все слои из сохранённого проекта")
         open_project_action.triggered.connect(self.open_project_dialog)
         file_menu.addAction(open_project_action)
+
+        # --- Правка (над активным G-code слоем) ---
+        undo_action = QAction("Отменить правку слоя", self)
+        undo_action.setShortcut("Ctrl+Z")
+        undo_action.setToolTip("Отменить последнее удаление линий / оптимизацию в выбранном G-code слое")
+        undo_action.triggered.connect(self.undo_layer_edit)
+        edit_menu.addAction(undo_action)
+
+        delete_lines_action = QAction("Удалить выделенные линии (оставить холостой ход)", self)
+        delete_lines_action.setShortcut("Delete")
+        delete_lines_action.setToolTip("Выделенные линии перестанут рисоваться, перо пройдёт по ним поднятым")
+        delete_lines_action.triggered.connect(lambda: self.delete_selected_lines())
+        edit_menu.addAction(delete_lines_action)
+
+        optimize_action = QAction("Оптимизировать холостые ходы", self)
+        optimize_action.setToolTip("Переставить штрихи выбранного G-code слоя так, чтобы перо меньше ходило поднятым")
+        optimize_action.triggered.connect(lambda: self.optimize_travel_moves())
+        edit_menu.addAction(optimize_action)
 
         toolbar.addSeparator()
 
@@ -1358,11 +1397,122 @@ class MainWindow(QMainWindow):
         item.setPos(pos)
         item.setTransform(tr)
         layer.file_path = filename   # номера строк теперь соответствуют файлу остатка
+        if hasattr(layer, '_undo_stack'):
+            layer._undo_stack.clear()
+            layer.dirty = False
+        self._refresh_layer_row(layer)
+        self._update_scene_bounds()
+
+    # ------------------------------------------------------------------
+    # Правка G-code слоя «на месте»: удалить линии, оптимизация холостых, отмена, сохранение
+    # ------------------------------------------------------------------
+
+    def _refresh_layer_row(self, layer):
         for r in range(self.layer_list.count()):
             li = self.layer_list.item(r)
             if li.data(Qt.UserRole) is layer:
                 self.update_layer_item_text(li, layer)
+
+    def _edit_target_layer(self, layer=None):
+        """G-code слой для правки: переданный или выбранный в списке (иначе подсказка)."""
+        from ..models.gcode_layer import GCodeLayer
+        layer = layer or self.get_current_layer()
+        if not isinstance(layer, GCodeLayer) or layer.current_item is None or layer.current_item.point_count() == 0:
+            self.statusBar().showMessage("Выберите в списке слой с G-code")
+            return None
+        return layer
+
+    def _after_layer_edit(self, layer, message):
+        self._refresh_layer_row(layer)
         self._update_scene_bounds()
+        self.statusBar().showMessage(message)
+
+    def delete_selected_lines(self, layer=None):
+        """Выделенные линии -> холостой ход: соединение между точками убирается, перо проходит поднятым."""
+        try:
+            layer = self._edit_target_layer(layer)
+            if layer is None:
+                return
+            item = layer.current_item
+            mask = item.segment_mask()
+            if mask is None:
+                self.statusBar().showMessage(
+                    "Сначала выделите линии: клик по линии, Shift — подряд, Ctrl — выборочно, двойной клик — весь блок")
+                return
+            changed = layer.delete_lines_to_travel(mask)
+            self._after_layer_edit(
+                layer, f"Линий убрано: {changed} — на их месте холостой ход. Ctrl+Z — отменить. "
+                       "Сохранить: Файл → Сохранить G-code слоя как...")
+        except Exception as e:
+            logger.error(f"Error deleting lines: {e}", exc_info=True)
+            QMessageBox.warning(self, "Правка", f"Не удалось выполнить: {e}")
+
+    def optimize_travel_moves(self, layer=None):
+        try:
+            layer = self._edit_target_layer(layer)
+            if layer is None:
+                return
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                res = layer.optimize_travel_moves()
+            finally:
+                QApplication.restoreOverrideCursor()
+            if res is None:
+                self.statusBar().showMessage("Оптимизировать нечего: в слое меньше двух штрихов")
+                return
+            before, after = res
+            ratio = before / after if after > 1e-9 else float('inf')
+            self._after_layer_edit(
+                layer, f"Холостые ходы: было {before / 1000:.1f} м, стало {after / 1000:.1f} м"
+                       f"{'' if ratio == float('inf') else f' (в {ratio:.1f} раза короче)'}. Ctrl+Z — отменить.")
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            logger.error(f"Error optimizing travel moves: {e}", exc_info=True)
+            QMessageBox.warning(self, "Правка", f"Не удалось выполнить: {e}")
+
+    def undo_layer_edit(self, layer=None):
+        layer = self._edit_target_layer(layer)
+        if layer is None:
+            return
+        if layer.undo_edit():
+            self._after_layer_edit(layer, "Правка отменена")
+        else:
+            self.statusBar().showMessage("Нечего отменять в этом слое")
+
+    def save_gcode_layer_as(self):
+        """Файл → «Сохранить G-code слоя как...»: специальное сохранение отредактированного слоя."""
+        try:
+            layer = self._edit_target_layer()
+            if layer is None:
+                return
+            from .gcode_save_dialog import GcodeSaveDialog
+            dialog = GcodeSaveDialog(self, layer)
+            if dialog.exec_() != GcodeSaveDialog.Accepted:
+                return
+            opts = dialog.get_options()
+            base = os.path.splitext(layer.file_path)[0] if getattr(layer, 'file_path', None) else layer.name
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "Сохранить G-code слоя", f"{base}_edit.gcode", "G-code files (*.gcode);;All files (*.*)")
+            if not filename:
+                return
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                ok = layer.save_edited(filename, **opts)
+            finally:
+                QApplication.restoreOverrideCursor()
+            if not ok:
+                QMessageBox.warning(self, "Сохранение", "Не удалось сохранить файл -- см. app_log.txt")
+                return
+            self._refresh_layer_row(layer)
+            self._update_scene_bounds()
+            current = self.layer_list.currentItem()
+            if current is not None:
+                self.on_layer_selected(current, None)   # панель слоя: положение/масштаб обнулены
+            self.statusBar().showMessage(f"Сохранено: {filename}")
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            logger.error(f"Error saving G-code layer: {e}", exc_info=True)
+            QMessageBox.warning(self, "Сохранение", f"Не удалось сохранить: {e}")
 
     def scale_view(self, factor):
         """Масштабирование вида и сетки -- с пределами, чтобы нельзя было
