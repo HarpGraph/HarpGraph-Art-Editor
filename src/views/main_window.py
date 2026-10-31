@@ -5,9 +5,9 @@ from PyQt5.QtWidgets import (QMainWindow, QDockWidget, QListWidget,
                            QLineEdit, QPushButton, QHBoxLayout,
                            QApplication, QSpinBox, QMessageBox,
                            QColorDialog, QDialog, QFormLayout, QScrollArea,
-                           QGraphicsEllipseItem, QFrame, QMenu)
+                           QGraphicsEllipseItem, QFrame, QMenu, QGraphicsPathItem, QGraphicsItem)
 from PyQt5.QtCore import Qt, QSettings, QPointF, QRectF, QEvent  # Добавляем QSettings
-from PyQt5.QtGui import QPainter, QColor, QPolygonF, QPen, QBrush, QPainterPath, QCursor
+from PyQt5.QtGui import QPainter, QColor, QPolygonF, QPen, QBrush, QPainterPath, QCursor, QTransform
 from src.views.image_size_dialog import ImageSizeDialog
 from src.views.svg_size_dialog import SvgSizeDialog
 from src.models.layer_types import LayerType
@@ -52,6 +52,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Layer Editor")
         self.layers = []  # Список всех слоев
         self._layer_counter = 0   # для автоимён «Слой N»
+        # общая отмена (Ctrl+Z): правки слоёв, перемещения, вырезание/копирование
+        self._undo_stack = []
+        self._press_geoms = None      # положения слоёв в момент нажатия мыши (для отмены перетаскивания)
+        self._frame_dragging = False
+        # инструменты преобразования: точка поворота и рамка масштаба/искажения
+        self.pivot_scene = None       # QPointF точки поворота на сцене или None (= центр рисунка)
+        self.pivot_item = None
+        self.pivot_pick_mode = False
+        self.transform_frame = None
+        self.current_layer_widget = None
         self.settings = QSettings('SVG_GCode_Editor', 'LayerEditor')
         # фиксированное "рабочее поле" (мм) -- стабильный ориентир для навигации,
         # как в Gcode_Terminal -- задаётся до setup_ui(), т.к. тулбар читает эти значения
@@ -214,6 +224,7 @@ class MainWindow(QMainWindow):
         self.layers.clear()
         self.layer_list.clear()
         self._layer_counter = 0
+        self._undo_stack.clear()
         self.on_layer_selected(None, None)
         self._update_scene_bounds()
 
@@ -422,11 +433,12 @@ class MainWindow(QMainWindow):
         file_menu.addAction(open_project_action)
 
         # --- Правка (над активным G-code слоем) ---
-        undo_action = QAction("Отменить правку слоя", self)
+        undo_action = QAction("Отменить", self)
         undo_action.setShortcut("Ctrl+Z")
-        undo_action.setToolTip("Отменить последнее удаление линий / оптимизацию в выбранном G-code слое")
-        undo_action.triggered.connect(self.undo_layer_edit)
+        undo_action.setToolTip("Отменить последнее действие: правку слоя, перемещение, вырезание, копирование")
+        undo_action.triggered.connect(self.undo_last)
         edit_menu.addAction(undo_action)
+        edit_menu.addSeparator()
 
         delete_lines_action = QAction("Удалить выделенные линии (оставить холостой ход)", self)
         delete_lines_action.setShortcut("Delete")
@@ -438,6 +450,11 @@ class MainWindow(QMainWindow):
         optimize_action.setToolTip("Переставить штрихи выбранного G-code слоя так, чтобы перо меньше ходило поднятым")
         optimize_action.triggered.connect(lambda: self.optimize_travel_moves())
         edit_menu.addAction(optimize_action)
+
+        clip_action = QAction("Убрать всё за пределами рабочего поля", self)
+        clip_action.setToolTip("Удалить из выбранного G-code слоя всё, что вне рабочего поля (линии на границе обрезаются)")
+        clip_action.triggered.connect(lambda: self.clip_layer_to_field())
+        edit_menu.addAction(clip_action)
 
         toolbar.addSeparator()
 
@@ -771,6 +788,8 @@ class MainWindow(QMainWindow):
 
     def cancel_polygon_selection(self):
         try:
+            if self.pivot_pick_mode:
+                self.end_pivot_pick()
             self.selection_mode = False
             self.selection_kind = None
             self.rect_start = None
@@ -863,10 +882,17 @@ class MainWindow(QMainWindow):
             if current:
                 layer = current.data(Qt.UserRole)
                 if layer:
+                    if self.transform_frame is not None and self.transform_frame.layer is not layer:
+                        self.set_transform_frame(None, False)   # рамка живёт только у выбранного слоя
                     # Создаем виджет для выбранного слоя
                     layer_widget = LayerWidget(layer)
+                    self.current_layer_widget = layer_widget
                     self.layer_widget_layout.addWidget(layer_widget)
+                    layer_widget.sync_with_window()
                     logger.debug(f"Created widget for layer: {layer.name}")
+            else:
+                self.current_layer_widget = None
+                self.set_transform_frame(None, False)
         except Exception as e:
             logger.error(f"Error in layer selection: {e}", exc_info=True)
 
@@ -888,6 +914,21 @@ class MainWindow(QMainWindow):
                 if obj.cursor().shape() in (Qt.OpenHandCursor, Qt.ClosedHandCursor):
                     obj.setCursor(Qt.ArrowCursor)
                 return False
+            etype0 = event.type()
+            # точка поворота: клик на листе ставит её, правая кнопка -- отмена
+            if self.pivot_pick_mode and etype0 == QEvent.GraphicsSceneMousePress:
+                if event.button() == Qt.LeftButton:
+                    self.end_pivot_pick()
+                    self.set_pivot(event.scenePos())
+                elif event.button() == Qt.RightButton:
+                    self.end_pivot_pick()
+                return True
+            # перетаскивание слоёв мышью -- запоминаем положения для отмены
+            if not self.selection_mode:
+                if etype0 == QEvent.GraphicsSceneMousePress and event.button() == Qt.LeftButton:
+                    self._remember_press_geometry()
+                elif etype0 == QEvent.GraphicsSceneMouseRelease and event.button() == Qt.LeftButton:
+                    self._record_mouse_move()
             if self.selection_mode and self.selection_kind == 'rect':
                 if self._rect_event(event):
                     return True
@@ -918,6 +959,10 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event):
+        if self.pivot_pick_mode and event.key() == Qt.Key_Escape:
+            self.end_pivot_pick()
+            event.accept()
+            return
         if self.selection_mode:
             key = event.key()
             polygon = self.selection_kind == 'polygon'
@@ -1359,21 +1404,34 @@ class MainWindow(QMainWindow):
             new_name = f"{layer.name} — {'вырезано' if cut else 'копия'}"
             rest_name = f"{layer.name} — остаток"
             logger.debug(f"Extracted {count} {what} to {filename} (cut={cut}), rest -> {rest_file}")
+            src_state = layer.snapshot()
+            created = []
             if cut:
-                self._add_gcode_layer_from_arrays(layer, new_name, pts, trav, filename)
+                created.append(self._add_gcode_layer_from_arrays(layer, new_name, pts, trav, filename))
                 self._replace_layer_content(layer, rest_pts, rest_trav, rest_file)
                 tail = (f"остаток ({len(rest_vidx)}) остался в исходном слое и в файле {rest_file}"
                         if rest_file else "в исходном слое ничего не осталось")
             else:
                 if rest_file:
                     # остаток -- отдельным скрытым слоем другого цвета (включается глазиком)
-                    self._add_gcode_layer_from_arrays(layer, rest_name, rest_pts, rest_trav, rest_file,
-                                                      visible=False, line_color='#0050ff')
-                self._add_gcode_layer_from_arrays(layer, new_name, pts, trav, filename)
+                    created.append(self._add_gcode_layer_from_arrays(layer, rest_name, rest_pts, rest_trav, rest_file,
+                                                                     visible=False, line_color='#0050ff'))
+                created.append(self._add_gcode_layer_from_arrays(layer, new_name, pts, trav, filename))
                 tail = (f"остаток ({len(rest_vidx)}) лежит в скрытом слое «{rest_name}» и в файле {rest_file}"
                         if rest_file else "остатка нет")
+
+            def undo_extract():
+                for new_layer in created:
+                    if new_layer is not None:
+                        self._remove_layer(new_layer)
+                if cut:
+                    layer.restore(src_state)
+                self._select_layer(layer)
+            self._push_undo("вырезание" if cut else "копирование", undo_extract, layers=[layer],
+                            nbytes=src_state['nbytes'] if cut else 0)
             self.statusBar().showMessage(
-                f"{'Вырезано' if cut else 'Скопировано'} {what}: {count} → слой «{new_name}», файл {filename}; {tail}")
+                f"{'Вырезано' if cut else 'Скопировано'} {what}: {count} → слой «{new_name}», файл {filename}; {tail}"
+                " Ctrl+Z — отменить.")
         except Exception as e:
             logger.error(f"Error extracting selected lines: {e}", exc_info=True)
             QMessageBox.warning(self, "Выделение", f"Не удалось выполнить: {e}")
@@ -1397,14 +1455,122 @@ class MainWindow(QMainWindow):
         item.setPos(pos)
         item.setTransform(tr)
         layer.file_path = filename   # номера строк теперь соответствуют файлу остатка
-        if hasattr(layer, '_undo_stack'):
-            layer._undo_stack.clear()
-            layer.dirty = False
+        layer.dirty = False
         self._refresh_layer_row(layer)
         self._update_scene_bounds()
 
     # ------------------------------------------------------------------
-    # Правка G-code слоя «на месте»: удалить линии, оптимизация холостых, отмена, сохранение
+    # Общая отмена (Ctrl+Z): правки слоя, перемещение/размер, вырезание/копирование
+    # ------------------------------------------------------------------
+
+    UNDO_LIMIT = 30
+    UNDO_BYTES = 600 * 1024 * 1024   # снимки больших слоёв не должны съесть всю память
+
+    def _push_undo(self, label, fn, layers=(), nbytes=0, kind=None, layer=None):
+        self._undo_stack.append({'label': label, 'fn': fn, 'layers': list(layers), 'nbytes': nbytes,
+                                 'kind': kind, 'layer': layer, 't': time.monotonic()})
+        while len(self._undo_stack) > self.UNDO_LIMIT or (
+                len(self._undo_stack) > 1 and sum(e['nbytes'] for e in self._undo_stack) > self.UNDO_BYTES):
+            self._undo_stack.pop(0)
+
+    def undo_last(self):
+        """Отменить последнее действие (правка слоя, перемещение, вырезание, копирование...)."""
+        try:
+            while self._undo_stack:
+                entry = self._undo_stack.pop()
+                if any(l not in self.layers for l in entry['layers']):
+                    continue   # слой уже удалён -- эту запись пропускаем
+                entry['fn']()
+                for l in entry['layers']:
+                    if l in self.layers:
+                        self._refresh_after_change(l)
+                self.statusBar().showMessage(f"Отменено: {entry['label']}")
+                return
+            self.statusBar().showMessage("Нечего отменять")
+        except Exception as e:
+            logger.error(f"Error in undo: {e}", exc_info=True)
+            QMessageBox.warning(self, "Отмена", f"Не удалось отменить: {e}")
+
+    def geometry_state(self, layer):
+        """Положение/масштаб/размер слоя -- для отмены перемещений."""
+        item = getattr(layer, 'current_item', None)
+        if item is None:
+            return None
+        st = {'pos': QPointF(item.pos()), 'transform': QTransform(item.transform()),
+              'scale': (getattr(layer, 'scale_x', None), getattr(layer, 'scale_y', None))}
+        if hasattr(layer, 'svg_size_mm'):
+            st['size'] = layer.svg_size_mm
+        elif hasattr(layer, 'image_size_mm'):
+            st['size'] = layer.image_size_mm
+        return st
+
+    def _restore_geometry(self, layer, st):
+        item = layer.current_item
+        if item is None:
+            return
+        if 'size' in st and st['size'][0] and hasattr(layer, 'set_size'):
+            layer.set_size(*st['size'])
+        item.setTransform(st['transform'])
+        item.setPos(st['pos'])
+        if st['scale'][0] is not None:
+            layer.scale_x, layer.scale_y = st['scale']
+
+    def record_geometry_undo(self, layer, coalesce=True):
+        """Вызывать ПЕРЕД изменением положения/размера слоя из панели. Серия быстрых правок
+        поля (набор числа) склеивается в одну запись отмены."""
+        st = self.geometry_state(layer)
+        if st is None:
+            return
+        now = time.monotonic()
+        top = self._undo_stack[-1] if self._undo_stack else None
+        if coalesce and top and top['kind'] == 'geom' and top['layer'] is layer and now - top['t'] < 1.2:
+            top['t'] = now
+            return
+        self._push_undo("положение/размер слоя", lambda: self._restore_geometry(layer, st),
+                        layers=[layer], kind='geom', layer=layer)
+
+    def finish_geometry_drag(self, layer, before):
+        """Конец перетаскивания маркера рамки: записать отмену, если слой изменился."""
+        self._frame_dragging = False
+        after = self.geometry_state(layer)
+        if before is not None and after is not None and (
+                before['pos'] != after['pos'] or before['transform'] != after['transform']):
+            self._push_undo("размер слоя рамкой", lambda: self._restore_geometry(layer, before), layers=[layer])
+        self._refresh_after_change(layer)
+
+    def _remember_press_geometry(self):
+        self._press_geoms = {l: self.geometry_state(l) for l in self.layers if l.current_item is not None}
+
+    def _record_mouse_move(self):
+        """Конец перетаскивания слоёв мышью на листе: что сдвинулось, то отменяется одной записью."""
+        before, self._press_geoms = self._press_geoms, None
+        if not before or self._frame_dragging:
+            return
+        moved = []
+        for layer, st in before.items():
+            now = self.geometry_state(layer) if layer in self.layers else None
+            if st is not None and now is not None and (st['pos'] != now['pos'] or st['transform'] != now['transform']):
+                moved.append((layer, st))
+        if moved:
+            def undo():
+                for layer, st in moved:
+                    self._restore_geometry(layer, st)
+            self._push_undo("перемещение слоя", undo, layers=[l for l, _ in moved])
+            for layer, _ in moved:
+                self._refresh_after_change(layer)
+
+    def _refresh_after_change(self, layer):
+        """Обновить всё, что показывает состояние слоя: строку списка, границы, рамку, поля панели."""
+        self._refresh_layer_row(layer)
+        self._update_scene_bounds()
+        self._refresh_frame()
+        w = self.current_layer_widget
+        if w is not None and getattr(w, 'layer', None) is layer and hasattr(w, 'refresh_geometry_fields'):
+            w.refresh_geometry_fields()
+
+    # ------------------------------------------------------------------
+    # Правка G-code слоя «на месте»: удалить линии, оптимизация холостых, поворот, отражение,
+    # обрезка по полю, сохранение
     # ------------------------------------------------------------------
 
     def _refresh_layer_row(self, layer):
@@ -1412,6 +1578,12 @@ class MainWindow(QMainWindow):
             li = self.layer_list.item(r)
             if li.data(Qt.UserRole) is layer:
                 self.update_layer_item_text(li, layer)
+
+    def _select_layer(self, layer):
+        for r in range(self.layer_list.count()):
+            if self.layer_list.item(r).data(Qt.UserRole) is layer:
+                self.layer_list.setCurrentRow(r)
+                return
 
     def _edit_target_layer(self, layer=None):
         """G-code слой для правки: переданный или выбранный в списке (иначе подсказка)."""
@@ -1423,9 +1595,11 @@ class MainWindow(QMainWindow):
         return layer
 
     def _after_layer_edit(self, layer, message):
-        self._refresh_layer_row(layer)
-        self._update_scene_bounds()
+        self._refresh_after_change(layer)
         self.statusBar().showMessage(message)
+
+    def _push_layer_undo(self, layer, label, state):
+        self._push_undo(label, lambda: layer.restore(state), layers=[layer], nbytes=state['nbytes'])
 
     def delete_selected_lines(self, layer=None):
         """Выделенные линии -> холостой ход: соединение между точками убирается, перо проходит поднятым."""
@@ -1439,7 +1613,9 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(
                     "Сначала выделите линии: клик по линии, Shift — подряд, Ctrl — выборочно, двойной клик — весь блок")
                 return
+            state = layer.snapshot()
             changed = layer.delete_lines_to_travel(mask)
+            self._push_layer_undo(layer, "удаление линий", state)
             self._after_layer_edit(
                 layer, f"Линий убрано: {changed} — на их месте холостой ход. Ctrl+Z — отменить. "
                        "Сохранить: Файл → Сохранить G-code слоя как...")
@@ -1452,6 +1628,7 @@ class MainWindow(QMainWindow):
             layer = self._edit_target_layer(layer)
             if layer is None:
                 return
+            state = layer.snapshot()
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
                 res = layer.optimize_travel_moves()
@@ -1460,6 +1637,7 @@ class MainWindow(QMainWindow):
             if res is None:
                 self.statusBar().showMessage("Оптимизировать нечего: в слое меньше двух штрихов")
                 return
+            self._push_layer_undo(layer, "оптимизация холостых ходов", state)
             before, after = res
             ratio = before / after if after > 1e-9 else float('inf')
             self._after_layer_edit(
@@ -1470,14 +1648,134 @@ class MainWindow(QMainWindow):
             logger.error(f"Error optimizing travel moves: {e}", exc_info=True)
             QMessageBox.warning(self, "Правка", f"Не удалось выполнить: {e}")
 
-    def undo_layer_edit(self, layer=None):
-        layer = self._edit_target_layer(layer)
-        if layer is None:
-            return
-        if layer.undo_edit():
-            self._after_layer_edit(layer, "Правка отменена")
+    def clip_layer_to_field(self, layer=None):
+        """Убрать из слоя всё, что за пределами рабочего поля (линии на границе обрезаются)."""
+        try:
+            layer = self._edit_target_layer(layer)
+            if layer is None:
+                return
+            rect = QRectF(-self.field_w_mm / 2.0, -self.field_h_mm / 2.0, self.field_w_mm, self.field_h_mm)
+            state = layer.snapshot()
+            res = layer.clip_to_rect(rect)
+            if res is None:
+                self.statusBar().showMessage("Внутри рабочего поля у этого слоя ничего нет — слой не изменён")
+                return
+            if res == (0, 0):
+                self.statusBar().showMessage("Весь слой уже внутри рабочего поля")
+                return
+            removed, clipped = res
+            self._push_layer_undo(layer, "обрезка по полю", state)
+            self._after_layer_edit(
+                layer, f"За полем убрано линий: {removed}, обрезано по границе: {clipped}. Ctrl+Z — отменить.")
+        except Exception as e:
+            logger.error(f"Error clipping to field: {e}", exc_info=True)
+            QMessageBox.warning(self, "Правка", f"Не удалось выполнить: {e}")
+
+    # --- поворот и отражение вокруг точки ---
+
+    def pivot_for(self, layer):
+        """Точка поворота/отражения (сцена): отмеченная мышью либо центр рисунка."""
+        if self.pivot_scene is not None:
+            return QPointF(self.pivot_scene)
+        rect = layer.scene_rect()
+        return rect.center() if rect is not None else QPointF(0, 0)
+
+    def set_pivot(self, point):
+        """point -- QPointF сцены или None (центр рисунка). Показывает крестик на листе."""
+        self.pivot_scene = None if point is None else QPointF(point)
+        if self.pivot_scene is None:
+            if self.pivot_item is not None:
+                self.pivot_item.setVisible(False)
         else:
-            self.statusBar().showMessage("Нечего отменять в этом слое")
+            if self.pivot_item is None:
+                path = QPainterPath()
+                path.moveTo(-12, 0)
+                path.lineTo(12, 0)
+                path.moveTo(0, -12)
+                path.lineTo(0, 12)
+                path.addEllipse(QPointF(0, 0), 6, 6)
+                pen = QPen(QColor(220, 30, 30), 2)
+                pen.setCosmetic(True)
+                self.pivot_item = QGraphicsPathItem(path)
+                self.pivot_item.setPen(pen)
+                self.pivot_item.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+                self.pivot_item.setAcceptedMouseButtons(Qt.NoButton)
+                self.pivot_item.setZValue(9500)
+                self.scene.addItem(self.pivot_item)
+            self.pivot_item.setPos(self.pivot_scene)
+            self.pivot_item.setVisible(True)
+        w = self.current_layer_widget
+        if w is not None and hasattr(w, 'refresh_pivot_fields'):
+            w.refresh_pivot_fields()
+
+    def start_pivot_pick(self):
+        """Следующий левый клик на листе ставит точку поворота."""
+        self.cancel_polygon_selection()
+        self.pivot_pick_mode = True
+        self._prev_drag_mode = self.view.dragMode()
+        self.view.setDragMode(QGraphicsView.NoDrag)
+        self.view.setCursor(Qt.CrossCursor)
+        self.view.setFocus()
+        self.statusBar().showMessage("Точка поворота: кликните на листе | Esc или правая кнопка — отмена")
+
+    def end_pivot_pick(self):
+        self.pivot_pick_mode = False
+        if self._prev_drag_mode is not None:
+            self.view.setDragMode(self._prev_drag_mode)
+            self._prev_drag_mode = None
+        self.view.setCursor(Qt.ArrowCursor)
+        self.statusBar().clearMessage()
+
+    def rotate_layer(self, angle_ccw, layer=None):
+        try:
+            layer = self._edit_target_layer(layer)
+            if layer is None or abs(angle_ccw) < 1e-9:
+                return
+            c = self.pivot_for(layer)
+            state = layer.snapshot()
+            layer.rotate_around(angle_ccw, c.x(), c.y())
+            self._push_layer_undo(layer, "поворот", state)
+            self._after_layer_edit(layer, f"Повёрнуто на {abs(angle_ccw):g}° "
+                                          f"{'против' if angle_ccw > 0 else 'по'} часовой. Ctrl+Z — отменить.")
+        except Exception as e:
+            logger.error(f"Error rotating layer: {e}", exc_info=True)
+            QMessageBox.warning(self, "Правка", f"Не удалось выполнить: {e}")
+
+    def flip_layer(self, horizontal, layer=None):
+        try:
+            layer = self._edit_target_layer(layer)
+            if layer is None:
+                return
+            c = self.pivot_for(layer)
+            state = layer.snapshot()
+            layer.flip_around(horizontal, c.x(), c.y())
+            self._push_layer_undo(layer, "отражение", state)
+            self._after_layer_edit(layer, "Отражено по " + ("горизонтали" if horizontal else "вертикали")
+                                   + ". Ctrl+Z — отменить.")
+        except Exception as e:
+            logger.error(f"Error flipping layer: {e}", exc_info=True)
+            QMessageBox.warning(self, "Правка", f"Не удалось выполнить: {e}")
+
+    # --- рамка: тянуть за края ---
+
+    def frame_active_for(self, layer):
+        return self.transform_frame is not None and self.transform_frame.layer is layer
+
+    def set_transform_frame(self, layer, on):
+        if self.transform_frame is not None:
+            self.scene.removeItem(self.transform_frame)
+            self.transform_frame = None
+        if on and layer is not None and layer.current_item is not None:
+            from src.graphics.transform_frame import TransformFrame
+            self.transform_frame = TransformFrame(self, layer)
+            self.scene.addItem(self.transform_frame)
+
+    def _refresh_frame(self):
+        if self.transform_frame is not None:
+            self.transform_frame.refresh()
+
+    def undo_layer_edit(self):
+        self.undo_last()
 
     def save_gcode_layer_as(self):
         """Файл → «Сохранить G-code слоя как...»: специальное сохранение отредактированного слоя."""
@@ -1495,6 +1793,7 @@ class MainWindow(QMainWindow):
                 self, "Сохранить G-code слоя", f"{base}_edit.gcode", "G-code files (*.gcode);;All files (*.*)")
             if not filename:
                 return
+            state = layer.snapshot()
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
                 ok = layer.save_edited(filename, **opts)
@@ -1503,12 +1802,8 @@ class MainWindow(QMainWindow):
             if not ok:
                 QMessageBox.warning(self, "Сохранение", "Не удалось сохранить файл -- см. app_log.txt")
                 return
-            self._refresh_layer_row(layer)
-            self._update_scene_bounds()
-            current = self.layer_list.currentItem()
-            if current is not None:
-                self.on_layer_selected(current, None)   # панель слоя: положение/масштаб обнулены
-            self.statusBar().showMessage(f"Сохранено: {filename}")
+            self._push_layer_undo(layer, "сохранение слоя", state)
+            self._after_layer_edit(layer, f"Сохранено: {filename}")
         except Exception as e:
             QApplication.restoreOverrideCursor()
             logger.error(f"Error saving G-code layer: {e}", exc_info=True)

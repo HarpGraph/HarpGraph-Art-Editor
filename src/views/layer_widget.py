@@ -100,6 +100,9 @@ class LayerWidget(QWidget):
                 # Положение и размер относительно рабочего поля (центр поля = 0,0)
                 self._setup_transform_ui(mode_layout)
 
+                # Поворот, отражение, рамка масштаба/искажения
+                self._setup_tools_ui(mode_layout)
+
                 # Редактирование G-code: все действия -- в одном списке (будет расти)
                 self._setup_edit_ui(mode_layout)
 
@@ -253,6 +256,10 @@ class LayerWidget(QWidget):
         opt_btn.setToolTip("Переставить штрихи так, чтобы перо меньше ходило поднятым (отмена — Ctrl+Z)")
         opt_btn.clicked.connect(lambda: self.window().optimize_travel_moves(self.layer))
         v.addWidget(opt_btn)
+        clip_btn = QPushButton("Убрать всё за пределами рабочего поля")
+        clip_btn.setToolTip("Удалить из слоя всё, что вне рабочего поля; линии на границе обрезаются ровно по границе")
+        clip_btn.clicked.connect(lambda: self.window().clip_layer_to_field(self.layer))
+        v.addWidget(clip_btn)
         self.edit_combo = QComboBox()
         self._edit_handlers = []
         for title, handler in self._gcode_edit_actions():
@@ -394,6 +401,133 @@ class LayerWidget(QWidget):
         self.tx_w.valueChanged.connect(lambda _v: self.on_transform_size_changed('w'))
         self.tx_h.valueChanged.connect(lambda _v: self.on_transform_size_changed('h'))
 
+    # ------------------------------------------------------------------
+    # Преобразование: рамка (тянуть за края), точка поворота, поворот, отражение
+    # ------------------------------------------------------------------
+
+    def _setup_tools_ui(self, parent_layout):
+        mw = self.window()
+        group = QGroupBox("Преобразование")
+        v = QVBoxLayout()
+
+        self.frame_cb = QCheckBox("Рамка: тянуть за края (масштаб / искажение)")
+        self.frame_cb.setToolTip("Вокруг рисунка появляется рамка с маркерами. За боковой маркер — "
+                                 "по одной оси, за угловой — по обеим, Shift — с сохранением пропорций.")
+        self.frame_cb.setChecked(hasattr(mw, 'frame_active_for') and mw.frame_active_for(self.layer))
+        self.frame_cb.toggled.connect(self.on_frame_toggled)
+        v.addWidget(self.frame_cb)
+
+        pivot_row = QHBoxLayout()
+        pivot_row.addWidget(QLabel("Точка:"))
+        self.pv_x = QDoubleSpinBox()
+        self.pv_x.setRange(-100000, 100000)
+        self.pv_x.setDecimals(2)
+        self.pv_x.setToolTip("Точка, вокруг которой поворачивают и отражают: X от центра поля (мм)")
+        pivot_row.addWidget(self.pv_x)
+        self.pv_y = QDoubleSpinBox()
+        self.pv_y.setRange(-100000, 100000)
+        self.pv_y.setDecimals(2)
+        self.pv_y.setToolTip("Y от центра поля, вверх (мм)")
+        pivot_row.addWidget(self.pv_y)
+        v.addLayout(pivot_row)
+
+        pivot_btns = QHBoxLayout()
+        pick_btn = QPushButton("Указать мышью")
+        pick_btn.setToolTip("Кликните на листе — там встанет красный крестик, вокруг него поворот и отражение")
+        pick_btn.clicked.connect(lambda: self.window().start_pivot_pick())
+        pivot_btns.addWidget(pick_btn)
+        center_btn = QPushButton("Центр рисунка")
+        center_btn.setToolTip("Убрать точку: поворачивать и отражать вокруг центра рисунка")
+        center_btn.clicked.connect(lambda: self.window().set_pivot(None))
+        pivot_btns.addWidget(center_btn)
+        v.addLayout(pivot_btns)
+
+        rot_row = QHBoxLayout()
+        rot_row.addWidget(QLabel("Угол:"))
+        self.rot_spin = QDoubleSpinBox()
+        self.rot_spin.setRange(0.0, 360.0)
+        self.rot_spin.setDecimals(1)
+        self.rot_spin.setSuffix("°")
+        self.rot_spin.setValue(15.0)
+        rot_row.addWidget(self.rot_spin)
+        ccw_btn = QPushButton("⟲")
+        ccw_btn.setToolTip("Повернуть против часовой стрелки вокруг точки")
+        ccw_btn.clicked.connect(lambda: self.window().rotate_layer(self.rot_spin.value(), self.layer))
+        rot_row.addWidget(ccw_btn)
+        cw_btn = QPushButton("⟳")
+        cw_btn.setToolTip("Повернуть по часовой стрелке вокруг точки")
+        cw_btn.clicked.connect(lambda: self.window().rotate_layer(-self.rot_spin.value(), self.layer))
+        rot_row.addWidget(cw_btn)
+        v.addLayout(rot_row)
+
+        flip_row = QHBoxLayout()
+        flip_h = QPushButton("↔ Отразить")
+        flip_h.setToolTip("Отразить по горизонтали (слева направо) относительно точки")
+        flip_h.clicked.connect(lambda: self.window().flip_layer(True, self.layer))
+        flip_row.addWidget(flip_h)
+        flip_v = QPushButton("↕ Отразить")
+        flip_v.setToolTip("Отразить по вертикали (сверху вниз) относительно точки")
+        flip_v.clicked.connect(lambda: self.window().flip_layer(False, self.layer))
+        flip_row.addWidget(flip_v)
+        v.addLayout(flip_row)
+
+        group.setLayout(v)
+        parent_layout.addWidget(group)
+
+        self.refresh_pivot_fields()
+        self.pv_x.valueChanged.connect(self.on_pivot_fields_changed)
+        self.pv_y.valueChanged.connect(self.on_pivot_fields_changed)
+
+    def sync_with_window(self):
+        """Вызывается главным окном, когда панель уже вставлена в окно: подтянуть состояние
+        рамки и точки поворота (в конструкторе главное окно ещё недоступно)."""
+        mw = self.window()
+        if hasattr(self, 'frame_cb') and hasattr(mw, 'frame_active_for'):
+            self.frame_cb.blockSignals(True)
+            self.frame_cb.setChecked(mw.frame_active_for(self.layer))
+            self.frame_cb.blockSignals(False)
+        self.refresh_pivot_fields()
+
+    def on_frame_toggled(self, on):
+        self.window().set_transform_frame(self.layer, on)
+
+    def refresh_pivot_fields(self):
+        """Показать точку поворота (или центр рисунка, если точка не задана)."""
+        try:
+            if not hasattr(self, 'pv_x'):
+                return
+            mw = self.window()
+            if not hasattr(mw, 'pivot_for'):
+                return
+            c = mw.pivot_for(self.layer)
+            self._set_spin(self.pv_x, c.x())
+            self._set_spin(self.pv_y, -c.y())
+        except Exception as e:
+            logger.error(f"Error refreshing pivot fields: {e}", exc_info=True)
+
+    def on_pivot_fields_changed(self, *_):
+        from PyQt5.QtCore import QPointF
+        self.window().set_pivot(QPointF(self.pv_x.value(), -self.pv_y.value()))
+
+    def refresh_geometry_fields(self):
+        """Обновить поля панели после правки/отмены, сделанных не через панель."""
+        try:
+            if hasattr(self, 'tx_x'):
+                self.refresh_transform_fields()
+            if hasattr(self, 'width_spin') and hasattr(self, 'height_spin'):
+                size = getattr(self.layer, 'svg_size_mm', None) or getattr(self.layer, 'image_size_mm', None)
+                if size and size[0]:
+                    self._set_spin(self.width_spin, size[0])
+                    self._set_spin(self.height_spin, size[1])
+            self.refresh_pivot_fields()
+        except Exception as e:
+            logger.error(f"Error refreshing geometry fields: {e}", exc_info=True)
+
+    def _record_undo(self, coalesce=True):
+        mw = self.window()
+        if hasattr(mw, 'record_geometry_undo'):
+            mw.record_geometry_undo(self.layer, coalesce)
+
     def _content_size(self):
         """Исходный (немасштабированный) размер рисунка в мм из массива точек."""
         item = getattr(self.layer, 'current_item', None)
@@ -444,6 +578,7 @@ class LayerWidget(QWidget):
             item = getattr(self.layer, 'current_item', None)
             if item is None:
                 return
+            self._record_undo()
             item.setPos(self.tx_x.value(), -self.tx_y.value())
             self._notify_bounds_changed()
         except Exception as e:
@@ -457,6 +592,7 @@ class LayerWidget(QWidget):
             w0, h0 = self._content_size()
             if w0 <= 0 or h0 <= 0:
                 return
+            self._record_undo()
             if which == 'w':
                 sx = self.tx_w.value() / w0
                 if self.tx_keep.isChecked():
@@ -482,6 +618,7 @@ class LayerWidget(QWidget):
             pts = getattr(item, 'pts', None)
             if item is None or pts is None or len(pts) == 0:
                 return
+            self._record_undo(coalesce=False)
             cx = float(pts[:, 0].max() + pts[:, 0].min()) / 2.0
             cy = float(pts[:, 1].max() + pts[:, 1].min()) / 2.0
             tr = item.transform()
@@ -496,6 +633,7 @@ class LayerWidget(QWidget):
             item = getattr(self.layer, 'current_item', None)
             if item is None:
                 return
+            self._record_undo(coalesce=False)
             item.setPos(0, 0)
             self._apply_scale(1.0, 1.0)
             self.refresh_transform_fields()
@@ -572,6 +710,7 @@ class LayerWidget(QWidget):
     def on_reset_position(self):
         try:
             if hasattr(self.layer, 'reset_position'):
+                self._record_undo(coalesce=False)
                 self.layer.reset_position()
         except Exception as e:
             logger.error(f"Error resetting layer position: {e}", exc_info=True)
@@ -582,6 +721,7 @@ class LayerWidget(QWidget):
             width = self.width_spin.value() if hasattr(self, 'width_spin') else None
             height = self.height_spin.value() if hasattr(self, 'height_spin') else None
             if width and height and hasattr(self.layer, 'set_size'):
+                self._record_undo()
                 self.layer.set_size(width, height)
         except Exception as e:
             logger.error(f"Error changing layer size: {e}", exc_info=True)

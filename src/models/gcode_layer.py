@@ -1,10 +1,11 @@
 from src.models.base_layer import BaseLayer
 from src.models.layer_types import LayerType
 from src.models.gcode_pathops import optimize_travel, write_gcode_layer
+from src.models.gcode_geometry import clip_strokes_to_rect
 from src.graphics.gcode_item import GCodeGraphicsItem
 from PyQt5.QtWidgets import QGraphicsScene, QGraphicsItem
-from PyQt5.QtCore import Qt, QObject, QRunnable, pyqtSignal, QThreadPool
-from PyQt5.QtGui import QColor
+from PyQt5.QtCore import Qt, QObject, QRunnable, pyqtSignal, QThreadPool, QPointF, QRectF
+from PyQt5.QtGui import QColor, QTransform
 import numpy as np
 import re
 import math
@@ -222,7 +223,6 @@ class GCodeLayer(BaseLayer):
         self.scale_x        = 1.0    # масштаб/искажение относительно рабочего поля
         self.scale_y        = 1.0
         self.dirty          = False  # слой изменён правкой и ещё не сохранён в файл
-        self._undo_stack    = []     # прежние состояния для отмены правок
         self._load_generation = 0   # fixes double-load race (stale results ignored)
         self._workers       = []    # keeps in-flight workers alive (avoids GC crash)
 
@@ -376,38 +376,108 @@ class GCodeLayer(BaseLayer):
         self.load_finished.emit(False)
 
     # ------------------------------------------------------------------
-    # Правка слоя «на месте» (удаление линий, оптимизация) с отменой, и сохранение
+    # Правка слоя «на месте» (удаление линий, оптимизация, поворот, обрезка по полю...)
+    # и сохранение. Отмена -- общий стек главного окна (snapshot/restore).
     # ------------------------------------------------------------------
-
-    UNDO_LIMIT = 8
 
     def _display_to_file(self, pts_display):
         return np.column_stack((pts_display[:, 0], -pts_display[:, 1]))
 
+    def snapshot(self):
+        """Полное состояние слоя для отмены. Массивы не копируются: правки всегда создают новые."""
+        item = self.current_item
+        return {
+            'pts': item.pts, 'trav': item.is_travel, 'lns': item.linenos,
+            'pos': QPointF(item.pos()), 'transform': QTransform(item.transform()),
+            'scale': (self.scale_x, self.scale_y),
+            'dirty': self.dirty, 'file_path': self.file_path, 'travel_z': self.travel_z,
+            'nbytes': int(item.pts.nbytes + item.is_travel.nbytes + item.linenos.nbytes),
+        }
+
+    def restore(self, st):
+        item = self.current_item
+        item.set_gcode_data(self._display_to_file(st['pts']), st['trav'], st['lns'])
+        item.setPos(st['pos'])
+        item.setTransform(st['transform'])
+        self.scale_x, self.scale_y = st['scale']
+        self.dirty, self.file_path, self.travel_z = st['dirty'], st['file_path'], st['travel_z']
+
     def apply_edit(self, pts_display, is_travel):
-        """Заменить содержимое слоя новыми вершинами (экранные координаты, Y вниз).
-        Прежнее состояние запоминается для отмены; слой помечается как изменённый."""
+        """Заменить вершины слоя (экранные координаты, Y вниз); положение/масштаб слоя остаются."""
         item = self.current_item
         if item is None:
             return False
-        self._undo_stack.append((item.pts, item.is_travel, item.linenos, self.dirty))
-        del self._undo_stack[:-self.UNDO_LIMIT]
         n = len(pts_display)
         item.set_gcode_data(self._display_to_file(pts_display), is_travel,
                             np.arange(1, n + 1, dtype=np.int32))
         self.dirty = True
         return True
 
-    def can_undo(self) -> bool:
-        return bool(self._undo_stack) and self.current_item is not None
+    def scene_points(self):
+        """Вершины в координатах сцены (с учётом положения и масштаба слоя), float64."""
+        item = self.current_item
+        pts = item.pts.astype(np.float64)
+        t = item.sceneTransform()
+        x = t.m11() * pts[:, 0] + t.m21() * pts[:, 1] + t.dx()
+        y = t.m12() * pts[:, 0] + t.m22() * pts[:, 1] + t.dy()
+        return np.column_stack((x, y))
 
-    def undo_edit(self):
-        if not self.can_undo():
-            return False
-        pts, trav, lns, dirty = self._undo_stack.pop()
-        self.current_item.set_gcode_data(self._display_to_file(pts), trav, lns)
-        self.dirty = dirty
-        return True
+    def scene_rect(self):
+        """Прямоугольник рисунка на сцене (QRectF) или None."""
+        item = self.current_item
+        if item is None or item.point_count() == 0:
+            return None
+        lo, hi = item.pts.min(axis=0), item.pts.max(axis=0)
+        return item.sceneTransform().mapRect(QRectF(float(lo[0]), float(lo[1]),
+                                                    float(hi[0] - lo[0]), float(hi[1] - lo[1])))
+
+    def apply_scene_edit(self, scene_pts, is_travel):
+        """Записать вершины, заданные в координатах сцены, «запекая» положение и масштаб:
+        слой остаётся там же, где виден, а сдвиг/масштаб обнуляются."""
+        item = self.current_item
+        n = len(scene_pts)
+        item.set_gcode_data(self._display_to_file(scene_pts), is_travel,
+                            np.arange(1, n + 1, dtype=np.int32))
+        item.setPos(0, 0)
+        item.setTransform(QTransform())
+        self.scale_x = self.scale_y = 1.0
+        self.dirty = True
+
+    def rotate_around(self, angle_deg, cx, cy):
+        """Повернуть рисунок вокруг точки (cx, cy) сцены; angle_deg > 0 -- против часовой на экране."""
+        item = self.current_item
+        pts = self.scene_points()
+        a = math.radians(angle_deg)
+        c, s = math.cos(a), math.sin(a)
+        dx, dy = pts[:, 0] - cx, pts[:, 1] - cy
+        new = np.column_stack((cx + dx * c + dy * s, cy - dx * s + dy * c))
+        self.apply_scene_edit(new, item.is_travel.copy())
+
+    def flip_around(self, horizontal, cx, cy):
+        """Отразить рисунок: horizontal=True -- слева направо (относительно вертикали через cx),
+        иначе сверху вниз (относительно горизонтали через cy)."""
+        item = self.current_item
+        pts = self.scene_points()
+        if horizontal:
+            pts[:, 0] = 2.0 * cx - pts[:, 0]
+        else:
+            pts[:, 1] = 2.0 * cy - pts[:, 1]
+        self.apply_scene_edit(pts, item.is_travel.copy())
+
+    def clip_to_rect(self, rect):
+        """Убрать всё, что за пределами прямоугольника сцены (линии на границе обрезаются).
+        Возвращает (removed, clipped), (0, 0) если всё внутри, или None, если внутри ничего нет
+        (слой в этом случае не меняется)."""
+        item = self.current_item
+        res = clip_strokes_to_rect(self.scene_points(), item.is_travel,
+                                   rect.left(), rect.top(), rect.right(), rect.bottom())
+        if res is None:
+            return None
+        pts, trav, removed, clipped = res
+        if removed == 0 and clipped == 0:
+            return 0, 0
+        self.apply_scene_edit(pts, trav)
+        return removed, clipped
 
     def delete_lines_to_travel(self, line_mask):
         """Выделенные линии перестают рисоваться: соединение между точками остаётся
@@ -444,14 +514,8 @@ class GCodeLayer(BaseLayer):
         item = self.current_item
         if item is None or item.point_count() == 0:
             return False
-        pts = item.pts.astype(np.float64)
-        baked = None
-        if apply_placement:
-            t = item.sceneTransform()
-            x = t.m11() * pts[:, 0] + t.m21() * pts[:, 1] + t.dx()
-            y = t.m12() * pts[:, 0] + t.m22() * pts[:, 1] + t.dy()
-            baked = np.column_stack((x, y))
-            pts = baked
+        pts = self.scene_points() if apply_placement else item.pts.astype(np.float64)
+        baked = pts if apply_placement else None
         file_pts = self._display_to_file(pts)
         linenos = write_gcode_layer(filename, file_pts, item.is_travel, travel_z=travel_z,
                                     draw_z=draw_z, feed=feed, with_z=with_z)
@@ -460,12 +524,10 @@ class GCodeLayer(BaseLayer):
         if with_z:
             self.travel_z = float(travel_z)   # так файл читается обратно: Z >= порога -- холостой ход
         if baked is not None:
-            from PyQt5.QtGui import QTransform
             item.set_gcode_data(file_pts, item.is_travel.copy(), linenos)
             item.setPos(0, 0)
             item.setTransform(QTransform())
             self.scale_x = self.scale_y = 1.0
-            self._undo_stack.clear()   # прежние состояния были в старой системе координат
         else:
             item.linenos = linenos
         return True
