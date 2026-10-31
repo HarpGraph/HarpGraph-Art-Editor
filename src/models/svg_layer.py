@@ -52,6 +52,8 @@ class SvgLayer(BaseLayer):
         self.pens          = []    # [{'color': '#RRGGBB', 'width_mm': float}] (fast parse only)
         self._subpath_pens = []    # pen number per raw subpath (same order)
         self._raw_subpaths = []   # unscaled, origin-relative (native SVG units)
+        self._sheet_frame  = True  # what the next load should use
+        self.sheet_frame   = False # what the loaded layer actually uses (see _on_parse_finished)
         self._load_generation = 0
         self._workers       = []    # keeps in-flight workers alive (avoids GC crash)
 
@@ -59,10 +61,14 @@ class SvgLayer(BaseLayer):
     # Loading
     # ------------------------------------------------------------------
 
-    def load_file(self, filename: str, width_mm: float = None, height_mm: float = None) -> bool:
+    def load_file(self, filename: str, width_mm: float = None, height_mm: float = None,
+                  sheet_frame: bool = True) -> bool:
+        """`sheet_frame=False` -- старый режим (рамка = границы линий); нужен только для
+        проектов, сохранённых до появления привязки к листу."""
         try:
             self.file_path = filename
             self._pending_size = (width_mm, height_mm)
+            self._sheet_frame = sheet_frame
             self._load_generation += 1
             generation = self._load_generation
 
@@ -92,9 +98,18 @@ class SvgLayer(BaseLayer):
         self.pens          = list(fast_info['pens']) if fast_info else []
         self._subpath_pens = list(fast_info['pen_index']) if fast_info else []
 
-        min_x, min_y, max_x, max_y = bbox
-        self._raw_subpaths = [[(x - min_x, y - min_y) for x, y in sp] for sp in subpaths]
-        self._raw_size = (max(max_x - min_x, 1e-6), max(max_y - min_y, 1e-6))
+        if fast_info and self._sheet_frame:
+            # Orchestrator SVG: the layer's frame is the SHEET (declared size), not the
+            # strokes' bbox -- so per-pen files and the combined file of one sheet
+            # land exactly on top of each other. Coordinates are already sheet-relative mm.
+            self._raw_subpaths = subpaths
+            self._raw_size = (max(fast_info['size_mm'][0], 1e-6), max(fast_info['size_mm'][1], 1e-6))
+            self.sheet_frame = True
+        else:
+            min_x, min_y, max_x, max_y = bbox
+            self._raw_subpaths = [[(x - min_x, y - min_y) for x, y in sp] for sp in subpaths]
+            self._raw_size = (max(max_x - min_x, 1e-6), max(max_y - min_y, 1e-6))
+            self.sheet_frame = False
 
         width_mm, height_mm = getattr(self, '_pending_size', (None, None))
         if not width_mm or not height_mm:

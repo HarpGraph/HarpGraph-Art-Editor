@@ -1002,9 +1002,8 @@ class MainWindow(QMainWindow):
                     from ..models.svg_utils import get_svg_bbox, parse_svg_pens, sniff_svg_mm_size, PX_TO_MM
                     fast = parse_svg_pens(filename)
                     if fast:
-                        # Orchestrator-format SVG: strokes bbox already in mm
-                        bx0, by0, bx1, by1 = fast['bbox']
-                        native_size, size_is_mm = (bx1 - bx0, by1 - by0), True
+                        # Orchestrator-format SVG: the whole sheet (declared mm size) is the layer
+                        native_size, size_is_mm = tuple(fast['size_mm']), True
                     else:
                         bbox = get_svg_bbox(filename)
                         if bbox:

@@ -54,6 +54,7 @@ def _serialize_layer(layer):
             'file_path': layer.file_path,
             'line_color': layer.line_color.name(),
             'width_mm': w, 'height_mm': h,
+            'sheet_frame': bool(layer.sheet_frame),
         }
     elif isinstance(layer, ImageLayer):
         w, h = layer.image_size_mm
@@ -188,7 +189,8 @@ def load_project(main_window, filename: str):
             h = float(entry.get('height_mm', 100.0))
             layer.load_finished.connect(
                 lambda ok, _l=layer, _e=entry: _apply_post_load(_l, _e) if ok else None)
-            layer.load_file(file_path, w, h)
+            # проекты, сохранённые до привязки к листу, открываются по-старому (без поля sheet_frame)
+            layer.load_file(file_path, w, h, sheet_frame=bool(entry.get('sheet_frame', False)))
             if list_item:
                 main_window.update_layer_item_text(list_item, layer)
             added += 1
